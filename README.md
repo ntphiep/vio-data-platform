@@ -125,6 +125,11 @@ python3 dashboards/build_dashboard.py && databricks bundle deploy -t prod
 cd local && uv run --no-project --with databricks-sdk --with requests push_to_bc.py --dry-run
 cp systemd/*.service systemd/*.timer ~/.config/systemd/user/ && systemctl --user daemon-reload
 systemctl --user enable --now vio-push-bc.timer
+
+# when a Business Central number series runs out (trial My Company: P-INV+ ended at 109999); the line starts
+# in 2015 because documents take their number by posting date
+uv run --no-project --with databricks-sdk --with requests extend_number_series.py \
+  --series P-INV+ --line_no 20000 --starting_no 110000 --ending_no 199999 --starting_date 2015-01-01
 ```
 
 The `dev` target writes to catalog `vio_travel_dev` (create it first with `sql/setup-catalog.sql`, catalog name

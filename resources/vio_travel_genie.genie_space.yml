@@ -1,0 +1,9 @@
+resources:
+  genie_spaces:
+    # Natural-language questions over the gold model and its metric views. Questions run on the SQL warehouse with
+    # the asking user's permissions, so personal columns stay masked for readers outside vio_pii_readers.
+    vio_travel_genie:
+      title: Vio Travel Genie
+      description: Ask about Vio Travel bookings, services, suppliers, agencies and payments due.
+      warehouse_id: ${var.warehouse_id}
+      file_path: ../genie/vio_travel_genie.geniespace.json

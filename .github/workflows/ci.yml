@@ -23,6 +23,8 @@ jobs:
         run: uv run --no-project --with pytest --with requests pytest -q tests
       - name: dashboard JSON matches its generator
         run: python3 dashboards/build_dashboard.py && git diff --exit-code dashboards/
+      - name: Genie space JSON matches its generator
+        run: python3 genie/build_genie_space.py && git diff --exit-code genie/
       - name: install Databricks CLI
         if: ${{ env.DATABRICKS_TOKEN != '' }}
         uses: databricks/setup-cli@main

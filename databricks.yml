@@ -1,5 +1,5 @@
-# Vio Travel data platform: Travel Compositor API -> Unity Catalog catalog vio_travel -> star schema,
-# Business Central integration tables and an AI/BI dashboard.
+# Vio Travel data platform: Travel Compositor API -> Unity Catalog catalog vio_travel -> Lakeflow pipeline
+# (bronze, silver with history, gold star schema) -> Business Central integration tables, AI/BI dashboard, Genie.
 # The catalog itself is created once with sql/setup-catalog.sql (Default Storage catalogs are created through SQL).
 bundle:
   name: vio_data_platform
@@ -12,8 +12,21 @@ variables:
     description: Unity Catalog catalog that holds every layer of this platform
     default: vio_travel
   warehouse_id:
-    description: SQL warehouse used by the dashboard and by local/push_to_bc.py
+    description: SQL warehouse used by the dashboard, the Genie space and local/push_to_bc.py
     default: 59d2b145a89ef5c1
+  pipeline_sp:
+    description: >-
+      Application ID of the service principal vio-travel-pipeline, which runs the pipeline and the jobs that read
+      the API; it is in the group vio_pii_readers and has READ on the secret scope vio-tc
+    default: 82205f93-7db0-4ca5-9d78-63bd916ac9db
+
+# The bundle folder, jobs and pipeline: the deploying user manages them, the service principal that runs them
+# reads the deployed files.
+permissions:
+  - level: CAN_MANAGE
+    user_name: ${workspace.current_user.userName}
+  - level: CAN_VIEW
+    service_principal_name: ${var.pipeline_sp}
 
 targets:
   dev:

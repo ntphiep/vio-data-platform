@@ -1,0 +1,34 @@
+resources:
+  jobs:
+    # The accommodation catalog of Travel Compositor is about 283 pages of 1000 hotels and changes slowly, so it is
+    # read once a week with 4 parallel requests instead of every 30 minutes. The next run of vio_travel_pipeline
+    # applies the changed rows (AUTO CDC on lastUpdate).
+    vio_travel_catalog:
+      name: vio_travel_catalog
+      description: Weekly snapshot of the Travel Compositor accommodation catalog into raw.landing/accommodations.
+      max_concurrent_runs: 1
+      timeout_seconds: 5400
+      run_as:
+        service_principal_name: ${var.pipeline_sp}
+      schedule:
+        quartz_cron_expression: "0 15 3 ? * SUN"
+        timezone_id: Asia/Ho_Chi_Minh
+        pause_status: UNPAUSED
+      email_notifications:
+        on_failure: [ "${workspace.current_user.userName}" ]
+      tags:
+        project: vio_travel
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - requests
+      tasks:
+        - task_key: extract_catalog
+          environment_key: default
+          max_retries: 1
+          min_retry_interval_millis: 600000
+          spark_python_task:
+            python_file: ../src/ingest_tc.py
+            parameters: ["--catalog", "${var.catalog}", "--entities", "accommodations", "--threads", "4"]

@@ -1,6 +1,7 @@
 """Generate dashboards/vio_travel_overview.lvdash.json, the AI/BI dashboard deployed by the bundle.
 
-The dashboard reads the star schema in gold, the integration tables in business_central and the run logs in ops.
+The dashboard reads the star schema in gold, the integration tables in business_central, and the run logs and the
+pipeline event log in ops.
 Queries name schema.table only; the catalog comes from dataset_catalog in resources/vio_travel_overview.dashboard.yml,
 so the dev target reads vio_travel_dev.
 
@@ -70,6 +71,55 @@ DATASETS = {
     "supplier_source_mix": """
         SELECT supplier_source, count(*) AS services, sum(cost_in_booking_currency) AS cost_usd
         FROM gold.obt_booking_service WHERE is_active AND booking_is_active GROUP BY ALL""",
+    # ---------------- page: Payments due ----------------
+    "receivable_kpis": """
+        SELECT count(*) AS pending_payments, sum(amount_to_pay) AS amount_to_pay_usd,
+               sum(CASE WHEN days_overdue > 0 THEN amount_to_pay END) AS overdue_usd,
+               count(DISTINCT booking_ref) AS bookings_with_amount_due
+        FROM gold.fact_pending_payment""",
+    "receivable_ageing": """
+        SELECT ageing_bucket, count(*) AS payments, sum(amount_to_pay) AS amount_usd
+        FROM gold.fact_pending_payment GROUP BY ALL""",
+    "receivable_by_due_month": """
+        SELECT date_trunc('MONTH', due_date) AS due_month, sum(amount_to_pay) AS amount_usd
+        FROM gold.fact_pending_payment WHERE due_date IS NOT NULL GROUP BY ALL""",
+    "receivable_top_agencies": """
+        SELECT a.agency_name, count(*) AS payments, sum(p.amount_to_pay) AS amount_usd,
+               sum(CASE WHEN p.days_overdue > 0 THEN p.amount_to_pay END) AS overdue_usd, max(p.days_overdue) AS max_days_overdue
+        FROM gold.fact_pending_payment p JOIN gold.dim_agency a ON a.agency_key = p.agency_key
+        GROUP BY ALL ORDER BY amount_usd DESC LIMIT 20""",
+    "payments_by_kind": """
+        SELECT payment_kind, coalesce(payment_system, 'not given') AS payment_system, count(*) AS payments,
+               sum(amount) AS amount
+        FROM gold.fact_booking_payment GROUP BY ALL""",
+    # ---------------- page: Ideas, hotels and checkouts ----------------
+    "idea_kpis": """
+        SELECT (SELECT count(*) FROM gold.dim_travel_idea WHERE active) AS active_ideas,
+               (SELECT count(*) FROM gold.fact_booking WHERE idea_key <> '-1' AND is_active) AS bookings_from_ideas,
+               (SELECT count(*) FROM gold.dim_accommodation WHERE has_datasheet) AS hotels_with_datasheet,
+               (SELECT avg(CAST(is_converted AS INT)) FROM gold.fact_purchase_attempt) AS checkout_conversion""",
+    "top_ideas": """
+        SELECT i.title, i.trip_type, count(*) AS bookings, sum(f.total_price) AS revenue_usd
+        FROM gold.fact_booking f JOIN gold.dim_travel_idea i ON i.idea_key = f.idea_key
+        WHERE f.is_active AND f.idea_key <> '-1'
+        GROUP BY ALL ORDER BY bookings DESC LIMIT 15""",
+    "top_hotels": """
+        SELECT accommodation_name, accommodation_category, accommodation_chain, round(accommodation_rating, 1) AS rating,
+               destination_name, count(DISTINCT booking_ref) AS bookings, sum(sale_amount) AS sale_usd
+        FROM gold.obt_booking_service
+        WHERE is_active AND booking_is_active AND accommodation_key <> '-1'
+        GROUP BY ALL ORDER BY bookings DESC LIMIT 20""",
+    "hotel_rating_mix": """
+        SELECT CASE WHEN accommodation_rating IS NULL THEN 'no rating'
+                    WHEN accommodation_rating >= 9 THEN '9 to 10' WHEN accommodation_rating >= 8 THEN '8 to 9'
+                    WHEN accommodation_rating >= 7 THEN '7 to 8' ELSE 'below 7' END AS rating_band,
+               count(*) AS services
+        FROM gold.obt_booking_service
+        WHERE is_active AND booking_is_active AND accommodation_key <> '-1' GROUP BY ALL""",
+    "status_changes_daily": """
+        SELECT date_trunc('DAY', valid_from) AS day, status, count(*) AS changes
+        FROM gold.fact_booking_status_change
+        WHERE valid_from >= timestampadd(DAY, -60, current_timestamp()) GROUP BY ALL""",
     # ---------------- page: Pipeline operations ----------------
     "extract_runs": """
         SELECT finished_at, entity, status, records, pages, round(bytes / 1048576, 2) AS mb,
@@ -83,13 +133,21 @@ DATASETS = {
                  AS minutes_since_push,
                (SELECT max_by(failed_rows, checked_at) FROM ops.dq_results
                 WHERE check_name = 'e2e_sales_waiting_for_push') AS sales_waiting_for_push""",
-    # latest result of every check that ran in the last day; star_schema and bc_tables skip unchanged runs,
-    # so their latest results can come from an earlier run than data_quality's
+    # latest result of every check that ran in the last day: pipeline expectations (severity expect), gold_ and
+    # e2e_ checks of data_quality, bc_ checks of bc_tables (which skips unchanged runs, so its latest results can
+    # come from an earlier run)
     "dq_latest": """
         SELECT check_name, severity, failed_rows, sample, checked_at, run_id FROM (
           SELECT *, row_number() OVER (PARTITION BY check_name ORDER BY checked_at DESC) AS rn
           FROM ops.dq_results WHERE checked_at >= timestampadd(DAY, -1, current_timestamp()))
         WHERE rn = 1 ORDER BY severity, failed_rows DESC""",
+    "pipeline_updates": """
+        SELECT origin.update_id AS update_id, min(timestamp) AS started_at,
+               timestampdiff(SECOND, min(timestamp), max(timestamp)) AS seconds,
+               max_by(details:update_progress.state::string, timestamp) AS state
+        FROM ops.pipeline_event_log WHERE event_type = 'update_progress'
+          AND timestamp >= timestampadd(DAY, -7, current_timestamp())
+        GROUP BY ALL""",
     "bc_sync_daily": """
         SELECT date_trunc('DAY', synced_at) AS day, result, count(*) AS documents
         FROM ops.bc_sync GROUP BY ALL""",
@@ -377,6 +435,117 @@ PAGES = [
         ],
     ),
     (
+        "payments_due",
+        "Payments due",
+        [
+            text(
+                "t_payments",
+                [
+                    "## Payments due\n",
+                    "Source: gold.fact_pending_payment (latest pending-payments snapshot of Travel Compositor), "
+                    "gold.fact_booking_payment, gold.dim_agency. Days overdue count from the deferred limit date.\n",
+                ],
+                (0, 0, 6, 2),
+            ),
+            counter("c_pending", "receivable_kpis", "pending_payments", "Pending payments", (0, 2, 2, 3)),
+            counter("c_due", "receivable_kpis", "amount_to_pay_usd", "Amount to pay (USD)", (2, 2, 2, 3)),
+            counter("c_overdue", "receivable_kpis", "overdue_usd", "Overdue (USD)", (4, 2, 2, 3)),
+            bar(
+                "b_ageing",
+                "receivable_ageing",
+                "ageing_bucket",
+                "amount_usd",
+                "Amount to pay by ageing bucket (USD)",
+                (0, 5, 3, 8),
+            ),
+            bar(
+                "b_due_month",
+                "receivable_by_due_month",
+                "due_month",
+                "amount_usd",
+                "Amount to pay by due month (USD)",
+                (3, 5, 3, 8),
+                temporal=True,
+            ),
+            table(
+                "t_receivable_agencies",
+                "receivable_top_agencies",
+                ["agency_name", "payments", "amount_usd", "overdue_usd", "max_days_overdue"],
+                "Top 20 agencies by amount to pay",
+                (0, 13, 6, 9),
+            ),
+            bar(
+                "b_payment_kind",
+                "payments_by_kind",
+                "payment_kind",
+                "amount",
+                "Payments recorded on bookings, by kind and payment system",
+                (0, 22, 6, 7),
+                color="payment_system",
+            ),
+        ],
+    ),
+    (
+        "ideas_hotels",
+        "Ideas, hotels and checkouts",
+        [
+            text(
+                "t_ideas",
+                [
+                    "## Ideas, hotels and checkouts\n",
+                    "Source: gold.dim_travel_idea, gold.dim_accommodation (datasheets of booked hotels), "
+                    "gold.fact_purchase_attempt, gold.fact_booking_status_change, gold.obt_booking_service.\n",
+                ],
+                (0, 0, 6, 2),
+            ),
+            counter("c_ideas", "idea_kpis", "active_ideas", "Active travel ideas", (0, 2, 2, 3)),
+            counter("c_from_ideas", "idea_kpis", "bookings_from_ideas", "Active bookings from an idea", (2, 2, 2, 3)),
+            counter(
+                "c_conversion", "idea_kpis", "checkout_conversion", "Checkouts that became a booking", (4, 2, 2, 3)
+            ),
+            table(
+                "t_top_ideas",
+                "top_ideas",
+                ["title", "trip_type", "bookings", "revenue_usd"],
+                "Top 15 travel ideas by active bookings",
+                (0, 5, 6, 8),
+            ),
+            table(
+                "t_top_hotels",
+                "top_hotels",
+                [
+                    "accommodation_name",
+                    "accommodation_category",
+                    "accommodation_chain",
+                    "rating",
+                    "destination_name",
+                    "bookings",
+                    "sale_usd",
+                ],
+                "Top 20 hotels by active bookings",
+                (0, 13, 6, 9),
+            ),
+            pie(
+                "p_rating",
+                "hotel_rating_mix",
+                "rating_band",
+                "services",
+                "Hotel services by rating (10 scale)",
+                (0, 22, 3, 8),
+            ),
+            bar(
+                "b_status_changes",
+                "status_changes_daily",
+                "day",
+                "changes",
+                "Booking changes per day, by new status (last 60 days)",
+                (3, 22, 3, 8),
+                color="status",
+                temporal=True,
+            ),
+        ],
+    ),
+    (
         "pipeline_ops",
         "Pipeline operations",
         [
@@ -384,9 +553,10 @@ PAGES = [
                 "t_ops",
                 [
                     "## Pipeline operations\n",
-                    "Source: ops.ingest_runs, ops.dq_results, ops.publish, ops.bc_sync, business_central.*. "
-                    "Job vio_travel_pipeline runs every 30 minutes, at minute 05 and 35; local/push_to_bc.py "
-                    "pushes within 5 minutes after each finished run.\n",
+                    "Source: ops.ingest_runs, ops.pipeline_event_log, ops.dq_results, ops.publish, ops.bc_sync, "
+                    "business_central.*. Job vio_travel_pipeline runs every 30 minutes, at minute 05 and 35, and "
+                    "triggers the pipeline vio_travel_lakehouse; local/push_to_bc.py pushes within 5 minutes after "
+                    "each finished run.\n",
                 ],
                 (0, 0, 6, 2),
             ),
@@ -405,12 +575,22 @@ PAGES = [
                 color="entity",
                 temporal=True,
             ),
+            bar(
+                "b_pipeline",
+                "pipeline_updates",
+                "started_at",
+                "seconds",
+                "Pipeline vio_travel_lakehouse updates, duration in seconds (last 7 days)",
+                (0, 12, 6, 7),
+                color="state",
+                temporal=True,
+            ),
             table(
                 "t_dq",
                 "dq_latest",
                 ["check_name", "severity", "failed_rows", "sample", "checked_at"],
-                "Data-quality checks of the latest job run",
-                (0, 12, 6, 10),
+                "Data-quality checks and pipeline expectations of the latest runs",
+                (0, 19, 6, 10),
             ),
             bar(
                 "b_sync",
@@ -418,7 +598,7 @@ PAGES = [
                 "day",
                 "documents",
                 "Documents pushed into Business Central per day",
-                (0, 22, 3, 8),
+                (0, 29, 3, 8),
                 color="result",
                 temporal=True,
             ),
@@ -428,7 +608,7 @@ PAGES = [
                 "hold_reason",
                 "documents",
                 "Documents held, by reason",
-                (3, 22, 3, 8),
+                (3, 29, 3, 8),
                 color="document",
             ),
             table(
@@ -447,14 +627,14 @@ PAGES = [
                     "window_to",
                 ],
                 "Extract runs (last 7 days)",
-                (0, 30, 6, 8),
+                (0, 37, 6, 8),
             ),
             table(
                 "t_publish",
                 "publish_log",
                 ["published_at", "run_id", "versions"],
                 "Business Central tables published (last 7 days)",
-                (0, 38, 6, 6),
+                (0, 45, 6, 6),
             ),
         ],
     ),

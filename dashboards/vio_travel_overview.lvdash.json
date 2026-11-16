@@ -110,6 +110,103 @@
       ]
     },
     {
+      "name": "receivable_kpis",
+      "displayName": "receivable_kpis",
+      "queryLines": [
+        "SELECT count(*) AS pending_payments, sum(amount_to_pay) AS amount_to_pay_usd,\n",
+        "sum(CASE WHEN days_overdue > 0 THEN amount_to_pay END) AS overdue_usd,\n",
+        "count(DISTINCT booking_ref) AS bookings_with_amount_due\n",
+        "FROM gold.fact_pending_payment\n"
+      ]
+    },
+    {
+      "name": "receivable_ageing",
+      "displayName": "receivable_ageing",
+      "queryLines": [
+        "SELECT ageing_bucket, count(*) AS payments, sum(amount_to_pay) AS amount_usd\n",
+        "FROM gold.fact_pending_payment GROUP BY ALL\n"
+      ]
+    },
+    {
+      "name": "receivable_by_due_month",
+      "displayName": "receivable_by_due_month",
+      "queryLines": [
+        "SELECT date_trunc('MONTH', due_date) AS due_month, sum(amount_to_pay) AS amount_usd\n",
+        "FROM gold.fact_pending_payment WHERE due_date IS NOT NULL GROUP BY ALL\n"
+      ]
+    },
+    {
+      "name": "receivable_top_agencies",
+      "displayName": "receivable_top_agencies",
+      "queryLines": [
+        "SELECT a.agency_name, count(*) AS payments, sum(p.amount_to_pay) AS amount_usd,\n",
+        "sum(CASE WHEN p.days_overdue > 0 THEN p.amount_to_pay END) AS overdue_usd, max(p.days_overdue) AS max_days_overdue\n",
+        "FROM gold.fact_pending_payment p JOIN gold.dim_agency a ON a.agency_key = p.agency_key\n",
+        "GROUP BY ALL ORDER BY amount_usd DESC LIMIT 20\n"
+      ]
+    },
+    {
+      "name": "payments_by_kind",
+      "displayName": "payments_by_kind",
+      "queryLines": [
+        "SELECT payment_kind, coalesce(payment_system, 'not given') AS payment_system, count(*) AS payments,\n",
+        "sum(amount) AS amount\n",
+        "FROM gold.fact_booking_payment GROUP BY ALL\n"
+      ]
+    },
+    {
+      "name": "idea_kpis",
+      "displayName": "idea_kpis",
+      "queryLines": [
+        "SELECT (SELECT count(*) FROM gold.dim_travel_idea WHERE active) AS active_ideas,\n",
+        "(SELECT count(*) FROM gold.fact_booking WHERE idea_key <> '-1' AND is_active) AS bookings_from_ideas,\n",
+        "(SELECT count(*) FROM gold.dim_accommodation WHERE has_datasheet) AS hotels_with_datasheet,\n",
+        "(SELECT avg(CAST(is_converted AS INT)) FROM gold.fact_purchase_attempt) AS checkout_conversion\n"
+      ]
+    },
+    {
+      "name": "top_ideas",
+      "displayName": "top_ideas",
+      "queryLines": [
+        "SELECT i.title, i.trip_type, count(*) AS bookings, sum(f.total_price) AS revenue_usd\n",
+        "FROM gold.fact_booking f JOIN gold.dim_travel_idea i ON i.idea_key = f.idea_key\n",
+        "WHERE f.is_active AND f.idea_key <> '-1'\n",
+        "GROUP BY ALL ORDER BY bookings DESC LIMIT 15\n"
+      ]
+    },
+    {
+      "name": "top_hotels",
+      "displayName": "top_hotels",
+      "queryLines": [
+        "SELECT accommodation_name, accommodation_category, accommodation_chain, round(accommodation_rating, 1) AS rating,\n",
+        "destination_name, count(DISTINCT booking_ref) AS bookings, sum(sale_amount) AS sale_usd\n",
+        "FROM gold.obt_booking_service\n",
+        "WHERE is_active AND booking_is_active AND accommodation_key <> '-1'\n",
+        "GROUP BY ALL ORDER BY bookings DESC LIMIT 20\n"
+      ]
+    },
+    {
+      "name": "hotel_rating_mix",
+      "displayName": "hotel_rating_mix",
+      "queryLines": [
+        "SELECT CASE WHEN accommodation_rating IS NULL THEN 'no rating'\n",
+        "WHEN accommodation_rating >= 9 THEN '9 to 10' WHEN accommodation_rating >= 8 THEN '8 to 9'\n",
+        "WHEN accommodation_rating >= 7 THEN '7 to 8' ELSE 'below 7' END AS rating_band,\n",
+        "count(*) AS services\n",
+        "FROM gold.obt_booking_service\n",
+        "WHERE is_active AND booking_is_active AND accommodation_key <> '-1' GROUP BY ALL\n"
+      ]
+    },
+    {
+      "name": "status_changes_daily",
+      "displayName": "status_changes_daily",
+      "queryLines": [
+        "SELECT date_trunc('DAY', valid_from) AS day, status, count(*) AS changes\n",
+        "FROM gold.fact_booking_status_change\n",
+        "WHERE valid_from >= timestampadd(DAY, -60, current_timestamp()) GROUP BY ALL\n"
+      ]
+    },
+    {
       "name": "extract_runs",
       "displayName": "extract_runs",
       "queryLines": [
@@ -139,6 +236,18 @@
         "SELECT *, row_number() OVER (PARTITION BY check_name ORDER BY checked_at DESC) AS rn\n",
         "FROM ops.dq_results WHERE checked_at >= timestampadd(DAY, -1, current_timestamp()))\n",
         "WHERE rn = 1 ORDER BY severity, failed_rows DESC\n"
+      ]
+    },
+    {
+      "name": "pipeline_updates",
+      "displayName": "pipeline_updates",
+      "queryLines": [
+        "SELECT origin.update_id AS update_id, min(timestamp) AS started_at,\n",
+        "timestampdiff(SECOND, min(timestamp), max(timestamp)) AS seconds,\n",
+        "max_by(details:update_progress.state::string, timestamp) AS state\n",
+        "FROM ops.pipeline_event_log WHERE event_type = 'update_progress'\n",
+        "AND timestamp >= timestampadd(DAY, -7, current_timestamp())\n",
+        "GROUP BY ALL\n"
       ]
     },
     {
@@ -1247,6 +1356,1218 @@
       ]
     },
     {
+      "name": "payments_due",
+      "displayName": "Payments due",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "t_payments",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Payments due\n",
+                "Source: gold.fact_pending_payment (latest pending-payments snapshot of Travel Compositor), gold.fact_booking_payment, gold.dim_agency. Days overdue count from the deferred limit date.\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "c_pending",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "receivable_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(pending_payments)",
+                      "expression": "SUM(`pending_payments`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(pending_payments)",
+                  "displayName": "Pending payments"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Pending payments"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "c_due",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "receivable_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(amount_to_pay_usd)",
+                      "expression": "SUM(`amount_to_pay_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(amount_to_pay_usd)",
+                  "displayName": "Amount to pay (USD)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Amount to pay (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "c_overdue",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "receivable_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(overdue_usd)",
+                      "expression": "SUM(`overdue_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(overdue_usd)",
+                  "displayName": "Overdue (USD)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Overdue (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "b_ageing",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "receivable_ageing",
+                  "fields": [
+                    {
+                      "name": "ageing_bucket",
+                      "expression": "`ageing_bucket`"
+                    },
+                    {
+                      "name": "sum(amount_usd)",
+                      "expression": "SUM(`amount_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "ageing_bucket",
+                  "displayName": "ageing_bucket",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(amount_usd)",
+                  "displayName": "amount_usd",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Amount to pay by ageing bucket (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 3,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "b_due_month",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "receivable_by_due_month",
+                  "fields": [
+                    {
+                      "name": "due_month",
+                      "expression": "`due_month`"
+                    },
+                    {
+                      "name": "sum(amount_usd)",
+                      "expression": "SUM(`amount_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "due_month",
+                  "displayName": "due_month",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(amount_usd)",
+                  "displayName": "amount_usd",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Amount to pay by due month (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 5,
+            "width": 3,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "t_receivable_agencies",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "receivable_top_agencies",
+                  "fields": [
+                    {
+                      "name": "agency_name",
+                      "expression": "`agency_name`"
+                    },
+                    {
+                      "name": "payments",
+                      "expression": "`payments`"
+                    },
+                    {
+                      "name": "amount_usd",
+                      "expression": "`amount_usd`"
+                    },
+                    {
+                      "name": "overdue_usd",
+                      "expression": "`overdue_usd`"
+                    },
+                    {
+                      "name": "max_days_overdue",
+                      "expression": "`max_days_overdue`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "itemsPerPage": 25,
+              "condensed": true,
+              "withRowNumber": false,
+              "invisibleColumns": [],
+              "allowHTMLByDefault": false,
+              "paginationSize": "default",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "agency_name",
+                    "displayName": "agency_name",
+                    "title": "agency_name",
+                    "order": 10000,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "payments",
+                    "displayName": "payments",
+                    "title": "payments",
+                    "order": 10001,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "amount_usd",
+                    "displayName": "amount_usd",
+                    "title": "amount_usd",
+                    "order": 10002,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "overdue_usd",
+                    "displayName": "overdue_usd",
+                    "title": "overdue_usd",
+                    "order": 10003,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "max_days_overdue",
+                    "displayName": "max_days_overdue",
+                    "title": "max_days_overdue",
+                    "order": 10004,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Top 20 agencies by amount to pay"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 13,
+            "width": 6,
+            "height": 9
+          }
+        },
+        {
+          "widget": {
+            "name": "b_payment_kind",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "payments_by_kind",
+                  "fields": [
+                    {
+                      "name": "payment_kind",
+                      "expression": "`payment_kind`"
+                    },
+                    {
+                      "name": "sum(amount)",
+                      "expression": "SUM(`amount`)"
+                    },
+                    {
+                      "name": "payment_system",
+                      "expression": "`payment_system`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "payment_kind",
+                  "displayName": "payment_kind",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(amount)",
+                  "displayName": "amount",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "payment_system",
+                  "displayName": "payment_system",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Payments recorded on bookings, by kind and payment system"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 22,
+            "width": 6,
+            "height": 7
+          }
+        }
+      ]
+    },
+    {
+      "name": "ideas_hotels",
+      "displayName": "Ideas, hotels and checkouts",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "t_ideas",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Ideas, hotels and checkouts\n",
+                "Source: gold.dim_travel_idea, gold.dim_accommodation (datasheets of booked hotels), gold.fact_purchase_attempt, gold.fact_booking_status_change, gold.obt_booking_service.\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "c_ideas",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "idea_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(active_ideas)",
+                      "expression": "SUM(`active_ideas`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(active_ideas)",
+                  "displayName": "Active travel ideas"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Active travel ideas"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "c_from_ideas",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "idea_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(bookings_from_ideas)",
+                      "expression": "SUM(`bookings_from_ideas`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(bookings_from_ideas)",
+                  "displayName": "Active bookings from an idea"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Active bookings from an idea"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "c_conversion",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "idea_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(checkout_conversion)",
+                      "expression": "SUM(`checkout_conversion`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(checkout_conversion)",
+                  "displayName": "Checkouts that became a booking"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Checkouts that became a booking"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "t_top_ideas",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "top_ideas",
+                  "fields": [
+                    {
+                      "name": "title",
+                      "expression": "`title`"
+                    },
+                    {
+                      "name": "trip_type",
+                      "expression": "`trip_type`"
+                    },
+                    {
+                      "name": "bookings",
+                      "expression": "`bookings`"
+                    },
+                    {
+                      "name": "revenue_usd",
+                      "expression": "`revenue_usd`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "itemsPerPage": 25,
+              "condensed": true,
+              "withRowNumber": false,
+              "invisibleColumns": [],
+              "allowHTMLByDefault": false,
+              "paginationSize": "default",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "title",
+                    "displayName": "title",
+                    "title": "title",
+                    "order": 10000,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "trip_type",
+                    "displayName": "trip_type",
+                    "title": "trip_type",
+                    "order": 10001,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "bookings",
+                    "displayName": "bookings",
+                    "title": "bookings",
+                    "order": 10002,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "revenue_usd",
+                    "displayName": "revenue_usd",
+                    "title": "revenue_usd",
+                    "order": 10003,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Top 15 travel ideas by active bookings"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 6,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "t_top_hotels",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "top_hotels",
+                  "fields": [
+                    {
+                      "name": "accommodation_name",
+                      "expression": "`accommodation_name`"
+                    },
+                    {
+                      "name": "accommodation_category",
+                      "expression": "`accommodation_category`"
+                    },
+                    {
+                      "name": "accommodation_chain",
+                      "expression": "`accommodation_chain`"
+                    },
+                    {
+                      "name": "rating",
+                      "expression": "`rating`"
+                    },
+                    {
+                      "name": "destination_name",
+                      "expression": "`destination_name`"
+                    },
+                    {
+                      "name": "bookings",
+                      "expression": "`bookings`"
+                    },
+                    {
+                      "name": "sale_usd",
+                      "expression": "`sale_usd`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "itemsPerPage": 25,
+              "condensed": true,
+              "withRowNumber": false,
+              "invisibleColumns": [],
+              "allowHTMLByDefault": false,
+              "paginationSize": "default",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "accommodation_name",
+                    "displayName": "accommodation_name",
+                    "title": "accommodation_name",
+                    "order": 10000,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "accommodation_category",
+                    "displayName": "accommodation_category",
+                    "title": "accommodation_category",
+                    "order": 10001,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "accommodation_chain",
+                    "displayName": "accommodation_chain",
+                    "title": "accommodation_chain",
+                    "order": 10002,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "rating",
+                    "displayName": "rating",
+                    "title": "rating",
+                    "order": 10003,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "destination_name",
+                    "displayName": "destination_name",
+                    "title": "destination_name",
+                    "order": 10004,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "bookings",
+                    "displayName": "bookings",
+                    "title": "bookings",
+                    "order": 10005,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "sale_usd",
+                    "displayName": "sale_usd",
+                    "title": "sale_usd",
+                    "order": 10006,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Top 20 hotels by active bookings"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 13,
+            "width": 6,
+            "height": 9
+          }
+        },
+        {
+          "widget": {
+            "name": "p_rating",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hotel_rating_mix",
+                  "fields": [
+                    {
+                      "name": "rating_band",
+                      "expression": "`rating_band`"
+                    },
+                    {
+                      "name": "sum(services)",
+                      "expression": "SUM(`services`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "pie",
+              "encodings": {
+                "angle": {
+                  "fieldName": "sum(services)",
+                  "displayName": "services",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "rating_band",
+                  "displayName": "rating_band",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Hotel services by rating (10 scale)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 22,
+            "width": 3,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "b_status_changes",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "status_changes_daily",
+                  "fields": [
+                    {
+                      "name": "day",
+                      "expression": "`day`"
+                    },
+                    {
+                      "name": "sum(changes)",
+                      "expression": "SUM(`changes`)"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "day",
+                  "displayName": "day",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(changes)",
+                  "displayName": "changes",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "status",
+                  "displayName": "status",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Booking changes per day, by new status (last 60 days)"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 22,
+            "width": 3,
+            "height": 8
+          }
+        }
+      ]
+    },
+    {
       "name": "pipeline_ops",
       "displayName": "Pipeline operations",
       "pageType": "PAGE_TYPE_CANVAS",
@@ -1257,7 +2578,7 @@
             "multilineTextboxSpec": {
               "lines": [
                 "## Pipeline operations\n",
-                "Source: ops.ingest_runs, ops.dq_results, ops.publish, ops.bc_sync, business_central.*. Job vio_travel_pipeline runs every 30 minutes, at minute 05 and 35; local/push_to_bc.py pushes within 5 minutes after each finished run.\n"
+                "Source: ops.ingest_runs, ops.pipeline_event_log, ops.dq_results, ops.publish, ops.bc_sync, business_central.*. Job vio_travel_pipeline runs every 30 minutes, at minute 05 and 35, and triggers the pipeline vio_travel_lakehouse; local/push_to_bc.py pushes within 5 minutes after each finished run.\n"
               ]
             }
           },
@@ -1455,6 +2776,71 @@
         },
         {
           "widget": {
+            "name": "b_pipeline",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "pipeline_updates",
+                  "fields": [
+                    {
+                      "name": "started_at",
+                      "expression": "`started_at`"
+                    },
+                    {
+                      "name": "sum(seconds)",
+                      "expression": "SUM(`seconds`)"
+                    },
+                    {
+                      "name": "state",
+                      "expression": "`state`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "started_at",
+                  "displayName": "started_at",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(seconds)",
+                  "displayName": "seconds",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "state",
+                  "displayName": "state",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Pipeline vio_travel_lakehouse updates, duration in seconds (last 7 days)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 12,
+            "width": 6,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
             "name": "t_dq",
             "queries": [
               {
@@ -1642,13 +3028,13 @@
               },
               "frame": {
                 "showTitle": true,
-                "title": "Data-quality checks of the latest job run"
+                "title": "Data-quality checks and pipeline expectations of the latest runs"
               }
             }
           },
           "position": {
             "x": 0,
-            "y": 12,
+            "y": 19,
             "width": 6,
             "height": 10
           }
@@ -1713,7 +3099,7 @@
           },
           "position": {
             "x": 0,
-            "y": 22,
+            "y": 29,
             "width": 3,
             "height": 8
           }
@@ -1778,7 +3164,7 @@
           },
           "position": {
             "x": 3,
-            "y": 22,
+            "y": 29,
             "width": 3,
             "height": 8
           }
@@ -2138,7 +3524,7 @@
           },
           "position": {
             "x": 0,
-            "y": 30,
+            "y": 37,
             "width": 6,
             "height": 8
           }
@@ -2274,7 +3660,7 @@
           },
           "position": {
             "x": 0,
-            "y": 38,
+            "y": 45,
             "width": 6,
             "height": 6
           }

@@ -9,10 +9,11 @@ ops.publish           write-audit-publish: table versions are published only whe
 
 Check names start with the layer they test (silver_, bronze_, bc_). End-to-end freshness checks run in the last
 task, data_quality.py. The task skips the rebuild when silver and ref have not changed since the last publish
-(ops.build_state); job parameter rebuild=true forces it.
+(content token in ops.build_state, recorded on every run); job parameter rebuild=true forces it.
 """
 
 import argparse
+import hashlib
 import json
 
 SERVICE_ARRAYS = [
@@ -31,17 +32,41 @@ TABLES = ["customers", "vendors", "sales_invoices", "sales_lines", "purchase_inv
 PII_TABLES = ["customers", "vendors"]
 
 
+def silver_token(sql, c: str) -> str:
+    """Token that changes only when the data this task reads changes.
+
+    Bookings: row count and a hash of every (booking_ref, last_update_at); services change only with their booking.
+    Agencies and suppliers: count and a hash of every current row. Ref tables: their Delta version, which changes
+    only on an edit. Pipeline tables are refreshed every run, so their Delta version is not a change signal.
+    """
+    parts = [
+        str(
+            sql(f"""SELECT count(*) || ':' || coalesce(sum(CAST(xxhash64(booking_ref, last_update_at) AS DECIMAL(38, 0))), 0)
+                         FROM {c}.silver.bookings""").first()[0]
+        )
+    ]
+    parts += [
+        str(
+            sql(f"""SELECT count(*) || ':' || coalesce(sum(CAST(xxhash64(*) AS DECIMAL(38, 0))), 0)
+                         FROM {c}.silver.{t}""").first()[0]
+        )
+        for t in ("agencies", "suppliers")
+    ]
+    parts += [
+        str(sql(f"DESCRIBE HISTORY {c}.ref.{t} LIMIT 1").first()["version"])
+        for t in ("umbrella_agency", "customer_map", "vendor_map")
+    ]
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+
 def silver_unchanged(sql, c: str, task: str, rebuild: str) -> tuple[bool, str]:
     """True when silver and ref have not changed since this task last built; also returns the current token."""
     sql(f"""CREATE TABLE IF NOT EXISTS {c}.ops.build_state (
         task STRING, run_id STRING, built_at TIMESTAMP, silver_token STRING)""")
-    last = {
-        r["task"]: r["t"]
-        for r in sql(f"""SELECT task, max_by(silver_token, built_at) AS t
-        FROM {c}.ops.build_state WHERE task IN ('bronze_silver', '{task}') GROUP BY task""").collect()
-    }
-    token = last.get("bronze_silver") or ""
-    return (rebuild.lower() != "true" and token != "" and last.get(task) == token), token
+    last = sql(f"""SELECT max_by(silver_token, built_at) AS t FROM {c}.ops.build_state
+                   WHERE task = '{task}'""").first()["t"]
+    token = silver_token(sql, c)
+    return (rebuild.lower() != "true" and last == token), token
 
 
 def record_build(sql, c: str, task: str, run_id: str, token: str) -> None:
@@ -60,8 +85,17 @@ def main():
     c = a.catalog
     sql = spark.sql
     b = f"{c}.{SCHEMA}"
+    # ref: mapping tables maintained by Vio Finance, created empty on the first run
+    sql(f"CREATE TABLE IF NOT EXISTS {c}.ref.umbrella_agency (agency_id STRING, note STRING)")
+    sql(f"""CREATE TABLE IF NOT EXISTS {c}.ref.customer_map (
+        agency_reference_key STRING, bc_customer_no STRING, display_name STRING, approved_by STRING, note STRING)""")
+    sql(f"""CREATE TABLE IF NOT EXISTS {c}.ref.vendor_map (
+        source_kind STRING, source_key STRING, bc_vendor_no STRING, display_name STRING, approved_by STRING,
+        note STRING)""")
     unchanged, token = silver_unchanged(sql, c, "bc_tables", a.rebuild)
     if unchanged:
+        # recorded anyway, so data_quality sees that this task checked the current silver
+        record_build(sql, c, "bc_tables", a.run_id, token)
         print("silver and ref unchanged since the last publish, nothing to do")
         return
 

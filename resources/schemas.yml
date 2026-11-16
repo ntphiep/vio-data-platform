@@ -8,17 +8,17 @@ resources:
     bronze:
       catalog_name: ${var.catalog}
       name: bronze
-      comment: Append-only copy of every landed record as VARIANT (Auto Loader). Contains personal data.
+      comment: Append-only copy of every landed record as VARIANT (Auto Loader in pipeline vio_travel_lakehouse). Contains personal data.
       lifecycle: {prevent_destroy: true}
     silver:
       catalog_name: ${var.catalog}
       name: silver
-      comment: Current state of bookings, booking services, agencies and suppliers. Contains personal data.
+      comment: Current state and SCD type 2 history of bookings, agencies, suppliers, users, travel ideas, payments and accommodations. Contains personal data.
       lifecycle: {prevent_destroy: true}
     gold:
       catalog_name: ${var.catalog}
       name: gold
-      comment: Analytics model - star schema (dim_*, fact_*) and one big table obt_booking_service. Rebuilt each run.
+      comment: Analytics model - star schema (dim_*, fact_*), one big table obt_booking_service and metric views (*_metrics).
     business_central:
       catalog_name: ${var.catalog}
       name: business_central
@@ -28,10 +28,15 @@ resources:
       name: ref
       comment: Mapping tables maintained by Vio Finance (umbrella agency, customer map, vendor map).
       lifecycle: {prevent_destroy: true}
+    governance:
+      catalog_name: ${var.catalog}
+      name: governance
+      comment: Masking function mask_pii and other governance helpers.
+      lifecycle: {prevent_destroy: true}
     ops:
       catalog_name: ${var.catalog}
       name: ops
-      comment: Run logs, watermark, data-quality results, publish versions, Business Central sync log.
+      comment: Run logs, watermark, pipeline event log, data-quality results, publish versions, Business Central sync log.
       lifecycle: {prevent_destroy: true}
 
   volumes:
@@ -42,9 +47,3 @@ resources:
       volume_type: MANAGED
       comment: One folder per entity, ingest_date and run; files older than 90 days are removed by extract_tc.
       lifecycle: {prevent_destroy: true}
-    checkpoints:
-      catalog_name: ${var.catalog}
-      schema_name: ${resources.schemas.ops.name}
-      name: checkpoints
-      volume_type: MANAGED
-      comment: Auto Loader checkpoints of the bronze streams.

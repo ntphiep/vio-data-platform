@@ -3,17 +3,19 @@ resources:
     vio_travel_pipeline:
       name: vio_travel_pipeline
       description: >-
-        Travel Compositor API -> volume raw.landing -> bronze -> silver, then two outputs built in parallel from
-        silver when it changed: the star schema in gold (read by the dashboard vio_travel_overview) and the
-        Business Central integration tables in business_central (published only after the blocking data-quality
-        checks pass, then pushed by local/push_to_bc.py outside Databricks because it uses a delegated Azure CLI
-        login). The last task, data_quality, checks that every stage is up to date with the one before it.
+        Travel Compositor API -> volume raw.landing (extract_tc) -> pipeline vio_travel_lakehouse (bronze, silver
+        with history, gold star schema read by the dashboard vio_travel_overview and the Genie space) -> Business
+        Central integration tables in business_central (bc_tables, published only after its blocking checks pass,
+        then pushed by local/push_to_bc.py outside Databricks because it uses a delegated Azure CLI login). The last
+        task, data_quality, records pipeline expectations, gold checks and end-to-end freshness.
       max_concurrent_runs: 1
+      run_as:
+        service_principal_name: ${var.pipeline_sp}
       timeout_seconds: 7200
       queue: {enabled: true}
       schedule:
-        # every 30 minutes, at minute 05 and 35; star_schema and bc_tables skip the rebuild when silver did not
-        # change, so night runs stay short (Free Edition has a daily compute quota)
+        # every 30 minutes, at minute 05 and 35; the pipeline refreshes only what changed and bc_tables skips the
+        # rebuild when silver did not change, so night runs stay short (Free Edition has a daily compute quota)
         quartz_cron_expression: "0 5/30 * * * ?"
         timezone_id: Asia/Ho_Chi_Minh
         pause_status: UNPAUSED
@@ -31,8 +33,6 @@ resources:
       parameters:
         - name: backfill_from
           default: ""
-        - name: full_refresh
-          default: "false"
         - name: rebuild
           default: "false"
       environments:
@@ -49,27 +49,17 @@ resources:
           spark_python_task:
             python_file: ../src/ingest_tc.py
             parameters: ["--catalog", "${var.catalog}", "--backfill_from", "{{job.parameters.backfill_from}}"]
-        - task_key: bronze_silver
+        - task_key: lakehouse
           depends_on:
             - task_key: extract_tc
-          environment_key: default
           max_retries: 1
-          spark_python_task:
-            python_file: ../src/bronze_silver.py
-            parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}",
-                         "--full_refresh", "{{job.parameters.full_refresh}}"]
-        - task_key: star_schema
-          depends_on:
-            - task_key: bronze_silver
-          environment_key: default
-          max_retries: 1
-          spark_python_task:
-            python_file: ../src/star_schema.py
-            parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}",
-                         "--rebuild", "{{job.parameters.rebuild}}"]
+          min_retry_interval_millis: 120000
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.vio_travel_lakehouse.id}
+            full_refresh: false
         - task_key: bc_tables
           depends_on:
-            - task_key: bronze_silver
+            - task_key: lakehouse
           environment_key: default
           max_retries: 1
           spark_python_task:
@@ -78,7 +68,6 @@ resources:
                          "--rebuild", "{{job.parameters.rebuild}}"]
         - task_key: data_quality
           depends_on:
-            - task_key: star_schema
             - task_key: bc_tables
           run_if: ALL_DONE          # also after a failed task, so the end-to-end state is always recorded
           environment_key: default

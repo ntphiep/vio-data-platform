@@ -1,0 +1,153 @@
+{
+  "version": 2,
+  "config": {
+    "sample_questions": [
+      {
+        "id": "dfdfcfb80dd55b3fa8e0771d54c58c78",
+        "question": [
+          "How many active bookings and how much revenue per month in 2026?"
+        ]
+      },
+      {
+        "id": "b169e7b28459583898d73f2dec273e47",
+        "question": [
+          "Which 10 suppliers have the highest sale amount this year?"
+        ]
+      },
+      {
+        "id": "c0cff760e5655ce395c32f100c88da0b",
+        "question": [
+          "Which agencies have the most overdue payments, and how much is overdue?"
+        ]
+      },
+      {
+        "id": "16c1771e1d6750a68d5ab32fc1fe4c34",
+        "question": [
+          "What share of purchase attempts became bookings?"
+        ]
+      },
+      {
+        "id": "e67c9a4362475621b5f5627c2d9c58f6",
+        "question": [
+          "Which hotels were booked most, with their rating?"
+        ]
+      }
+    ]
+  },
+  "data_sources": {
+    "tables": [
+      {
+        "identifier": "vio_travel.gold.booking_metrics",
+        "description": [
+          "Metric view: bookings, revenue, gross margin, cancellation rate."
+        ]
+      },
+      {
+        "identifier": "vio_travel.gold.dim_accommodation",
+        "description": [
+          "Booked hotels with category, chain and rating on a 10 scale."
+        ]
+      },
+      {
+        "identifier": "vio_travel.gold.dim_agency",
+        "description": [
+          "Agencies (customers of Vio). agency_key -1 = Unknown."
+        ]
+      },
+      {
+        "identifier": "vio_travel.gold.dim_date",
+        "description": [
+          "Calendar; date_key is yyyyMMdd."
+        ]
+      },
+      {
+        "identifier": "vio_travel.gold.dim_travel_idea",
+        "description": [
+          "Travel ideas (packaged itineraries) linked to bookings by idea_key."
+        ]
+      },
+      {
+        "identifier": "vio_travel.gold.fact_booking",
+        "description": [
+          "One booking. is_active = status BOOKED or RQ. Amounts in the booking currency (USD)."
+        ]
+      },
+      {
+        "identifier": "vio_travel.gold.fact_booking_payment",
+        "description": [
+          "Payments recorded on bookings (first, second, additional, manual)."
+        ]
+      },
+      {
+        "identifier": "vio_travel.gold.fact_booking_status_change",
+        "description": [
+          "History of booking status and amount changes."
+        ]
+      },
+      {
+        "identifier": "vio_travel.gold.fact_pending_payment",
+        "description": [
+          "Payments still due; days_overdue > 0 is late; ageing_bucket groups them."
+        ]
+      },
+      {
+        "identifier": "vio_travel.gold.fact_purchase_attempt",
+        "description": [
+          "Checkouts started on the microsite; is_converted when they became a booking."
+        ]
+      },
+      {
+        "identifier": "vio_travel.gold.obt_booking_service",
+        "description": [
+          "One service of a booking with every attribute; use for supplier, destination, service category and accommodation questions. Filter is_active AND booking_is_active for sold services."
+        ]
+      },
+      {
+        "identifier": "vio_travel.gold.receivable_metrics",
+        "description": [
+          "Metric view: amounts due and overdue by agency and ageing bucket."
+        ]
+      },
+      {
+        "identifier": "vio_travel.gold.service_metrics",
+        "description": [
+          "Metric view: services, sale amount, cost and margin by supplier and destination."
+        ]
+      }
+    ]
+  },
+  "instructions": {
+    "text_instructions": [
+      {
+        "id": "b36eb17e5f225032b3a41e23999b2bf1",
+        "content": [
+          "Vio Travel is a destination management company; bookings come from Travel Compositor.",
+          "Revenue is total_price of active bookings (is_active). Gross margin is total_price minus net_provider.",
+          "Amounts are in the booking currency, USD for almost every booking; do not add amounts of different currencies.",
+          "Prefer the metric views booking_metrics, service_metrics and receivable_metrics with MEASURE() for totals.",
+          "Personal columns (names, e-mails, phones) are masked for most readers; do not try to unmask them."
+        ]
+      }
+    ],
+    "example_question_sqls": [
+      {
+        "id": "22b6be1a5af957d3ab44cea310987028",
+        "question": [
+          "Revenue and gross margin by month"
+        ],
+        "sql": [
+          "SELECT `Created month`, MEASURE(Revenue) AS revenue,\n  MEASURE(`Gross margin`) AS gross_margin\nFROM vio_travel.gold.booking_metrics GROUP BY ALL ORDER BY 1"
+        ]
+      },
+      {
+        "id": "71bb9d1d85255919a32610252e08d38d",
+        "question": [
+          "Overdue amount by ageing bucket"
+        ],
+        "sql": [
+          "SELECT `Ageing bucket`, MEASURE(`Amount to pay`) AS amount_to_pay\nFROM vio_travel.gold.receivable_metrics GROUP BY ALL ORDER BY 1"
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+resources:
+  pipelines:
+    # Lakeflow Spark Declarative Pipeline: bronze (Auto Loader), silver (AUTO CDC, SCD type 1 and 2, AUTO CDC FROM
+    # SNAPSHOT), gold (materialized views with liquid clustering and informational keys), expectations on every
+    # layer. Triggered by the job vio_travel_pipeline, not continuous: Free Edition allows one active pipeline and
+    # a daily compute quota, and the source changes every 30 minutes at most.
+    vio_travel_lakehouse:
+      name: vio_travel_lakehouse
+      catalog: ${var.catalog}
+      schema: silver
+      serverless: true
+      channel: CURRENT
+      continuous: false
+      root_path: ../src/lakehouse
+      libraries:
+        - glob:
+            include: ../src/lakehouse/**
+      configuration:
+        vio.catalog: ${var.catalog}
+      # the event log as a Unity Catalog table, read by the task data_quality and the dashboard page Operations
+      event_log:
+        catalog: ${var.catalog}
+        schema: ops
+        name: pipeline_event_log
+      run_as:
+        service_principal_name: ${var.pipeline_sp}
+      notifications:
+        - email_recipients: [ "${workspace.current_user.userName}" ]
+          alerts: [ on-update-failure, on-update-fatal-failure, on-flow-failure ]
+      # the jobs that start updates run as the service principal; the bundle-wide CAN_VIEW cannot start one
+      permissions:
+        - level: CAN_RUN
+          service_principal_name: ${var.pipeline_sp}
+      tags:
+        project: vio_travel
+        contains_pii: "true"

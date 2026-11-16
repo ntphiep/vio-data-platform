@@ -1,0 +1,26 @@
+resources:
+  jobs:
+    # Tags, masks on history tables, grants and metric views. Runs as the deploying user (catalog owner), who may
+    # change tags and grants; run it after each deploy, and it re-applies itself weekly.
+    vio_travel_governance:
+      name: vio_travel_governance
+      description: Unity Catalog tags, column masks, grants and the metric views of catalog ${var.catalog}.
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: "0 45 3 ? * SUN"
+        timezone_id: Asia/Ho_Chi_Minh
+        pause_status: UNPAUSED
+      email_notifications:
+        on_failure: [ "${workspace.current_user.userName}" ]
+      tags:
+        project: vio_travel
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+      tasks:
+        - task_key: governance
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/governance.py
+            parameters: ["--catalog", "${var.catalog}"]

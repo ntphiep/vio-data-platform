@@ -92,7 +92,7 @@ get a vendor number only through `ref.vendor_map`.
 | `databricks.yml`, `resources/` | Databricks Asset Bundle: schemas, volumes, job `vio_travel_pipeline`, dashboard `vio_travel_overview`, SQL alert `pipeline_freshness` |
 | `src/` | job tasks |
 | `dashboards/build_dashboard.py` | generates `dashboards/vio_travel_overview.lvdash.json`; edit the script, not the JSON |
-| `local/` | `push_to_bc.py`, `config.json`, systemd units for the push after each job run |
+| `local/` | `push_to_bc.py`, `config.json`, systemd units for the push after each job run, `extend_number_series.py` for a Business Central number series that ran out |
 | `sql/` | one-time SQL: `setup-catalog.sql`, `ref-maps-lab-seed.sql` |
 | `tests/` | unit tests for the API client and the Business Central client |
 | `pyproject.toml`, `.github/workflows/ci.yml` | ruff lint and format rules; CI runs ruff, the tests, a check that the dashboard JSON matches its generator, and `databricks bundle validate` when the repository secrets `DATABRICKS_HOST` and `DATABRICKS_TOKEN` exist |

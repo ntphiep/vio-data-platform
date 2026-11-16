@@ -261,7 +261,6 @@ class BC:
             rows.append((cur, day, round(1 / per_lcy, 6)))  # 1 foreign = x LCY
         if not rows:
             return [], unavailable
-        code = "VIOFX" + dt.datetime.now(dt.UTC).strftime("%m%d%H%M%S")
         recs = "".join(
             f"<CurrencyExchangeRate><CurrencyCode>{c}</CurrencyCode><StartingDate>{d}</StartingDate>"
             f"<ExchangeRateAmount>1</ExchangeRateAmount><AdjustmentExchRateAmount>1</AdjustmentExchRateAmount>"
@@ -269,18 +268,26 @@ class BC:
             f"<RelationalAdjmtExchRateAmt>{x}</RelationalAdjmtExchRateAmt></CurrencyExchangeRate>"
             for c, d, x in rows
         )
+        self.apply_package("VIOFX", 330, "CurrencyExchangeRateList", recs)
+        return rows, unavailable
+
+    def apply_package(self, prefix, table_id, list_tag, records_xml):
+        """Insert or modify rows of one Business Central table with a RapidStart configuration package through
+        the automation API: create package, upload file, import, apply, delete. records_xml holds one element per
+        row, named after the table, with one child per field (field name without spaces and dots)."""
+        code = prefix + dt.datetime.now(dt.UTC).strftime("%m%d%H%M%S")
         xml = (
             f'<?xml version="1.0" encoding="UTF-16" standalone="yes"?><DataList Code="{code}" '
-            f'PackageName="Vio FX {code}" LanguageID="1033" ProcessingOrder="0" ExcludeConfigTables="1">'
-            f"<CurrencyExchangeRateList><TableID>330</TableID><PackageCode>{code}</PackageCode>{recs}"
-            f"</CurrencyExchangeRateList></DataList>"
+            f'PackageName="Vio {code}" LanguageID="1033" ProcessingOrder="0" ExcludeConfigTables="1">'
+            f"<{list_tag}><TableID>{table_id}</TableID><PackageCode>{code}</PackageCode>{records_xml}"
+            f"</{list_tag}></DataList>"
         )
         auto = f"{self.root}/api/microsoft/automation/v2.0/companies({self.cfg['bc_company_id']})"
         pkg = self.ok(
             self.call(
                 "POST",
                 f"{auto}/configurationPackages",
-                data=json.dumps({"code": code, "packageName": f"Vio FX {code}"}),
+                data=json.dumps({"code": code, "packageName": f"Vio {code}"}),
             ),
             "create package",
         )
@@ -305,11 +312,10 @@ class BC:
                     self.sleep(3)
                 if st.get(field) != "Completed" or st.get("numberOfErrors"):
                     raise RuntimeError(
-                        f"exchange rate package {code} {action}: {st.get(field)}, errors {st.get('numberOfErrors')}"
+                        f"configuration package {code} {action}: {st.get(field)}, errors {st.get('numberOfErrors')}"
                     )
         finally:
             self.call("DELETE", f"{auto}/configurationPackages({pid})", headers={"If-Match": "*"})
-        return rows, unavailable
 
 
 def push_document(bc, kind, key_field, key, body, lines, cancel=False):

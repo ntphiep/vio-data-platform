@@ -7,17 +7,45 @@ ops.publish           write-audit-publish: table versions are published only whe
                       local/push_to_bc.py reads the tables AS OF the last published versions, so it never sees a
                       half-written or failed build, and header and line tables always match.
 
-Alerting checks run after publish and fail the task (which sends the job's failure e-mail) when data is stale:
-no booking update for 48 h, a failing or stale extract, or no push into Business Central for 24 h.
+Check names start with the layer they test (silver_, bronze_, bc_). End-to-end freshness checks run in the last
+task, data_quality.py. The task skips the rebuild when silver and ref have not changed since the last publish
+(ops.build_state); job parameter rebuild=true forces it.
 """
+
 import argparse
 import json
 
-SERVICE_ARRAYS = ["hotelservice", "transferservice", "transportservice", "ticketservice", "closedtourservice",
-                  "carservice", "insuranceservice", "cruiseservice", "itemservice"]
+SERVICE_ARRAYS = [
+    "hotelservice",
+    "transferservice",
+    "transportservice",
+    "ticketservice",
+    "closedtourservice",
+    "carservice",
+    "insuranceservice",
+    "cruiseservice",
+    "itemservice",
+]
 SCHEMA = "business_central"
 TABLES = ["customers", "vendors", "sales_invoices", "sales_lines", "purchase_invoices", "purchase_lines"]
 PII_TABLES = ["customers", "vendors"]
+
+
+def silver_unchanged(sql, c: str, task: str, rebuild: str) -> tuple[bool, str]:
+    """True when silver and ref have not changed since this task last built; also returns the current token."""
+    sql(f"""CREATE TABLE IF NOT EXISTS {c}.ops.build_state (
+        task STRING, run_id STRING, built_at TIMESTAMP, silver_token STRING)""")
+    last = {
+        r["task"]: r["t"]
+        for r in sql(f"""SELECT task, max_by(silver_token, built_at) AS t
+        FROM {c}.ops.build_state WHERE task IN ('bronze_silver', '{task}') GROUP BY task""").collect()
+    }
+    token = last.get("bronze_silver") or ""
+    return (rebuild.lower() != "true" and token != "" and last.get(task) == token), token
+
+
+def record_build(sql, c: str, task: str, run_id: str, token: str) -> None:
+    sql(f"INSERT INTO {c}.ops.build_state SELECT '{task}', '{run_id}', current_timestamp(), '{token}'")
 
 
 def main():
@@ -26,11 +54,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--catalog", default="vio_travel")
     ap.add_argument("--run_id", default="")
+    ap.add_argument("--rebuild", default="false", help="true: rebuild even when silver has not changed")
     a = ap.parse_args()
     spark = SparkSession.builder.getOrCreate()
     c = a.catalog
     sql = spark.sql
     b = f"{c}.{SCHEMA}"
+    unchanged, token = silver_unchanged(sql, c, "bc_tables", a.rebuild)
+    if unchanged:
+        print("silver and ref unchanged since the last publish, nothing to do")
+        return
 
     # ---------------- business_central: shapes of the Business Central API ---------------------------------------------
     # Number prefixes keep Travel Compositor keys visible in Business Central and inside the 20-character
@@ -155,65 +188,109 @@ def main():
     known = ",".join(f"'{k}'" for k in SERVICE_ARRAYS + ["manualServices"])
     checks = {
         # block: the push step would send broken or ambiguous documents, nothing is published
-        "silver_booking_ref_unique": ("block", f"""SELECT booking_ref AS k FROM {c}.silver.bookings
-            GROUP BY booking_ref HAVING count(*) > 1"""),
-        "sales_key_unique": ("block", f"""SELECT external_document_number AS k FROM {b}.sales_invoices
-            GROUP BY 1 HAVING count(*) > 1"""),
-        "purchase_key_unique": ("block", f"""SELECT purchase_key AS k FROM {b}.purchase_invoices
-            GROUP BY 1 HAVING count(*) > 1"""),
-        "party_number_unique": ("block", f"""SELECT bc_number AS k FROM {b}.customers GROUP BY 1 HAVING count(*) > 1
-            UNION ALL SELECT bc_number FROM {b}.vendors GROUP BY 1 HAVING count(*) > 1"""),
-        "sales_invoice_without_customer": ("block", f"""SELECT external_document_number AS k FROM {send_sales} i
-            LEFT ANTI JOIN {b}.customers p ON p.bc_number = i.customer_number"""),
-        "purchase_invoice_without_vendor": ("block", f"""SELECT purchase_key AS k FROM {send_purch} i
-            LEFT ANTI JOIN {b}.vendors p ON p.bc_number = i.vendor_number"""),
-        "document_without_currency": ("block", f"""SELECT external_document_number AS k FROM {send_sales}
-            WHERE currency_code IS NULL UNION ALL SELECT purchase_key FROM {send_purch} WHERE currency_code IS NULL"""),
-        "sales_lines_mixed_currency": ("block", f"""SELECT external_document_number AS k FROM {send_sales}
-            WHERE line_currencies <> currency_code"""),
-        "field_length_over_limit": ("block", f"""SELECT bc_number AS k FROM {b}.customers WHERE length(bc_number) > 20
+        "silver_booking_ref_unique": (
+            "block",
+            f"""SELECT booking_ref AS k FROM {c}.silver.bookings
+            GROUP BY booking_ref HAVING count(*) > 1""",
+        ),
+        "bc_sales_key_unique": (
+            "block",
+            f"""SELECT external_document_number AS k FROM {b}.sales_invoices
+            GROUP BY 1 HAVING count(*) > 1""",
+        ),
+        "bc_purchase_key_unique": (
+            "block",
+            f"""SELECT purchase_key AS k FROM {b}.purchase_invoices
+            GROUP BY 1 HAVING count(*) > 1""",
+        ),
+        "bc_party_number_unique": (
+            "block",
+            f"""SELECT bc_number AS k FROM {b}.customers GROUP BY 1 HAVING count(*) > 1
+            UNION ALL SELECT bc_number FROM {b}.vendors GROUP BY 1 HAVING count(*) > 1""",
+        ),
+        "bc_sales_invoice_without_customer": (
+            "block",
+            f"""SELECT external_document_number AS k FROM {send_sales} i
+            LEFT ANTI JOIN {b}.customers p ON p.bc_number = i.customer_number""",
+        ),
+        "bc_purchase_invoice_without_vendor": (
+            "block",
+            f"""SELECT purchase_key AS k FROM {send_purch} i
+            LEFT ANTI JOIN {b}.vendors p ON p.bc_number = i.vendor_number""",
+        ),
+        "bc_document_without_currency": (
+            "block",
+            f"""SELECT external_document_number AS k FROM {send_sales}
+            WHERE currency_code IS NULL UNION ALL SELECT purchase_key FROM {send_purch} WHERE currency_code IS NULL""",
+        ),
+        "bc_sales_lines_mixed_currency": (
+            "block",
+            f"""SELECT external_document_number AS k FROM {send_sales}
+            WHERE line_currencies <> currency_code""",
+        ),
+        "bc_field_length_over_limit": (
+            "block",
+            f"""SELECT bc_number AS k FROM {b}.customers WHERE length(bc_number) > 20
             UNION ALL SELECT bc_number FROM {b}.vendors WHERE length(bc_number) > 20
             UNION ALL SELECT purchase_key FROM {send_purch} WHERE length(vendor_invoice_number) > 35
-            UNION ALL SELECT external_document_number FROM {send_sales} WHERE length(external_document_number) > 35"""),
+            UNION ALL SELECT external_document_number FROM {send_sales} WHERE length(external_document_number) > 35""",
+        ),
         # warn: recorded in ops.dq_results only
-        "bronze_malformed_line": ("warn", f"""SELECT source_file AS k FROM {c}.bronze.tc_bookings WHERE doc IS NULL
+        "bronze_malformed_line": (
+            "warn",
+            f"""SELECT source_file AS k FROM {c}.bronze.tc_bookings WHERE doc IS NULL
             UNION ALL SELECT source_file FROM {c}.bronze.tc_agencies WHERE doc IS NULL
-            UNION ALL SELECT source_file FROM {c}.bronze.tc_suppliers WHERE doc IS NULL"""),
-        "booking_without_last_update": ("warn", f"""SELECT booking_ref AS k FROM {c}.silver.bookings
-            WHERE last_update_at IS NULL"""),
-        "unknown_service_array": ("warn", f"""SELECT DISTINCT e.key AS k FROM {c}.silver.bookings b,
-            LATERAL variant_explode(b.payload) e WHERE lower(e.key) LIKE '%service%' AND e.key NOT IN ({known})"""),
-        "active_service_without_amount": ("warn", f"""SELECT booking_ref || '/' || service_id AS k
-            FROM {c}.silver.booking_services WHERE status IN ('BOOKED','RQ') AND (sale_amount IS NULL OR cost_amount IS NULL)"""),
-        "active_booking_without_lines": ("warn", f"""SELECT b.booking_ref AS k FROM {c}.silver.bookings b
+            UNION ALL SELECT source_file FROM {c}.bronze.tc_suppliers WHERE doc IS NULL""",
+        ),
+        "silver_booking_without_last_update": (
+            "warn",
+            f"""SELECT booking_ref AS k FROM {c}.silver.bookings
+            WHERE last_update_at IS NULL""",
+        ),
+        "silver_unknown_service_array": (
+            "warn",
+            f"""SELECT DISTINCT e.key AS k FROM {c}.silver.bookings b,
+            LATERAL variant_explode(b.payload) e WHERE lower(e.key) LIKE '%service%' AND e.key NOT IN ({known})""",
+        ),
+        "silver_active_service_without_amount": (
+            "warn",
+            f"""SELECT booking_ref || '/' || service_id AS k
+            FROM {c}.silver.booking_services WHERE status IN ('BOOKED','RQ') AND (sale_amount IS NULL OR cost_amount IS NULL)""",
+        ),
+        "bc_active_booking_without_lines": (
+            "warn",
+            f"""SELECT b.booking_ref AS k FROM {c}.silver.bookings b
             LEFT ANTI JOIN {b}.sales_invoices i ON i.external_document_number = b.booking_ref
-            WHERE b.status IN ('BOOKED','RQ')"""),
-        "sales_held_customer_unmapped": ("warn", f"""SELECT external_document_number AS k
-            FROM {b}.sales_invoices WHERE hold_reason = 'CUSTOMER_UNMAPPED' AND doc_action = 'UPSERT'"""),
-        "purchase_held_vendor_unmapped": ("warn", f"""SELECT purchase_key AS k
-            FROM {b}.purchase_invoices WHERE hold_reason = 'VENDOR_UNMAPPED' AND doc_action = 'UPSERT'"""),
-        "held_party_not_in_snapshot": ("warn", f"""SELECT external_document_number AS k FROM {b}.sales_invoices
+            WHERE b.status IN ('BOOKED','RQ')""",
+        ),
+        "bc_sales_held_customer_unmapped": (
+            "warn",
+            f"""SELECT external_document_number AS k
+            FROM {b}.sales_invoices WHERE hold_reason = 'CUSTOMER_UNMAPPED' AND doc_action = 'UPSERT'""",
+        ),
+        "bc_purchase_held_vendor_unmapped": (
+            "warn",
+            f"""SELECT purchase_key AS k
+            FROM {b}.purchase_invoices WHERE hold_reason = 'VENDOR_UNMAPPED' AND doc_action = 'UPSERT'""",
+        ),
+        "bc_held_party_not_in_snapshot": (
+            "warn",
+            f"""SELECT external_document_number AS k FROM {b}.sales_invoices
             WHERE hold_reason = 'AGENCY_NOT_IN_SNAPSHOT' UNION ALL SELECT purchase_key FROM {b}.purchase_invoices
-            WHERE hold_reason = 'SUPPLIER_NOT_IN_SNAPSHOT'"""),
-        "booking_total_differs_from_lines": ("warn", f"""SELECT external_document_number AS k FROM {send_sales}
-            WHERE abs(total_price - lines_total) > 0.05"""),
-        "negative_document_total": ("warn", f"""SELECT external_document_number AS k FROM {send_sales}
-            WHERE lines_total < 0 UNION ALL SELECT purchase_key FROM {send_purch} WHERE lines_total < 0"""),
-        # alert: the tables are still published, then the task fails so the job's failure e-mail goes out
-        "bookings_not_updated_48h": ("alert", f"""SELECT 'silver.bookings' AS k FROM {c}.silver.bookings
-            HAVING max(last_update_at) < current_timestamp() - INTERVAL 48 HOURS"""),
-        # the latest extract of an entity did not succeed, or its last success is older than 26 hours
-        "extract_failing_or_stale": ("alert", f"""SELECT entity || ' ' || last_status AS k FROM (
-            SELECT entity, max_by(status, finished_at) AS last_status,
-                   max(CASE WHEN status = 'SUCCESS' THEN finished_at END) AS last_success
-            FROM {c}.ops.ingest_runs GROUP BY entity)
-            WHERE last_status <> 'SUCCESS' OR last_success < current_timestamp() - INTERVAL 26 HOURS"""),
-        "push_not_synced_24h": ("alert", f"""SELECT 'ops.bc_sync' AS k FROM (SELECT 1)
-            WHERE (SELECT max(synced_at) FROM {c}.ops.bc_sync) < current_timestamp() - INTERVAL 24 HOURS"""),
+            WHERE hold_reason = 'SUPPLIER_NOT_IN_SNAPSHOT'""",
+        ),
+        "bc_booking_total_differs_from_lines": (
+            "warn",
+            f"""SELECT external_document_number AS k FROM {send_sales}
+            WHERE abs(total_price - lines_total) > 0.05""",
+        ),
+        "bc_negative_document_total": (
+            "warn",
+            f"""SELECT external_document_number AS k FROM {send_sales}
+            WHERE lines_total < 0 UNION ALL SELECT purchase_key FROM {send_purch} WHERE lines_total < 0""",
+        ),
     }
-    sql(f"""CREATE TABLE IF NOT EXISTS {c}.ops.bc_sync (synced_at TIMESTAMP, doc_type STRING, doc_key STRING,
-             payload_hash STRING, bc_company STRING, bc_id STRING, bc_number STRING, result STRING, error STRING)""")
-    failed = {"block": [], "alert": []}
+    failed = {"block": []}
     rows_out = []
     for name, (severity, q) in checks.items():
         r = sql(f"SELECT count(*) AS n, slice(collect_list(k), 1, 5) AS s FROM ({q})").collect()[0]
@@ -221,10 +298,11 @@ def main():
         print(f"DQ {severity:5} {name}: {r['n']} sample={r['s']}")
         if r["n"] and severity in failed:
             failed[severity].append(name)
-    spark.createDataFrame(rows_out, "run_id STRING, check_name STRING, severity STRING, failed_rows BIGINT, "
-                                    "sample STRING") \
-        .selectExpr("run_id", "current_timestamp() AS checked_at", "check_name", "severity", "failed_rows", "sample") \
-        .write.mode("append").saveAsTable(f"{c}.ops.dq_results")
+    spark.createDataFrame(
+        rows_out, "run_id STRING, check_name STRING, severity STRING, failed_rows BIGINT, sample STRING"
+    ).selectExpr(
+        "run_id", "current_timestamp() AS checked_at", "check_name", "severity", "failed_rows", "sample"
+    ).write.mode("append").saveAsTable(f"{c}.ops.dq_results")
 
     # ---------------- publish: only a build that passed every blocking check --------------------
     sql(f"CREATE TABLE IF NOT EXISTS {c}.ops.publish (run_id STRING, published_at TIMESTAMP, versions STRING)")
@@ -233,12 +311,11 @@ def main():
     if failed["block"]:
         raise RuntimeError(f"blocking data-quality checks failed, nothing published: {failed['block']}")
     versions = {t: sql(f"DESCRIBE HISTORY {b}.{t} LIMIT 1").collect()[0]["version"] for t in TABLES}
-    spark.createDataFrame([(a.run_id, json.dumps(versions))], "run_id STRING, versions STRING") \
-        .selectExpr("run_id", "current_timestamp() AS published_at", "versions") \
-        .write.mode("append").saveAsTable(f"{c}.ops.publish")
+    spark.createDataFrame([(a.run_id, json.dumps(versions))], "run_id STRING, versions STRING").selectExpr(
+        "run_id", "current_timestamp() AS published_at", "versions"
+    ).write.mode("append").saveAsTable(f"{c}.ops.publish")
     print("published", versions)
-    if failed["alert"]:
-        raise RuntimeError(f"freshness alert (tables were published): {failed['alert']}")
+    record_build(sql, c, "bc_tables", a.run_id, token)
 
 
 if __name__ == "__main__":

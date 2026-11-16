@@ -1,5 +1,6 @@
 """Unit tests for the Business Central push helpers (no network, no Databricks).
 Run: uv run --no-project --with pytest --with requests pytest pipeline/tests"""
+
 import sys
 from pathlib import Path
 
@@ -99,7 +100,25 @@ def test_posted_document_is_never_changed(monkeypatch):
 
 
 def test_cancel_empties_draft_lines_without_deleting_header(monkeypatch):
-    client, s, _ = bc([Resp(200, {"value": [{"id": "d1", "status": "Draft"}]}),
-                       Resp(200, {"value": [{"id": "l1"}, {"id": "l2"}]}), Resp(204), Resp(204)], monkeypatch)
+    client, s, _ = bc(
+        [
+            Resp(200, {"value": [{"id": "d1", "status": "Draft"}]}),
+            Resp(200, {"value": [{"id": "l1"}, {"id": "l2"}]}),
+            Resp(204),
+            Resp(204),
+        ],
+        monkeypatch,
+    )
     result, _ = m.push_document(client, "sales", "externalDocumentNumber", "EXA-1", {}, [], cancel=True)
     assert result == "CANCELLED_DRAFT_EMPTIED" and s.calls == ["GET", "GET", "DELETE", "DELETE"]
+
+
+def test_exchange_rate_missing_at_source_skips_only_that_currency(monkeypatch):
+    # BC already has no rate for FJD; the rate source answers 404 for FJD, so no package is created
+    client, s, _ = bc([Resp(200, {"value": []})], monkeypatch)
+    client.cfg["fx_source"] = "https://fx.example"
+    monkeypatch.setattr(m.requests, "get", lambda url, params, timeout: Resp(404))
+    loaded, unavailable = client.ensure_exchange_rates({("FJD", "2026-11-09"), ("AUD", "2026-11-09")})
+    assert loaded == []
+    assert unavailable == {("FJD", "2026-11-09")}
+    assert s.calls == ["GET"]

@@ -14,35 +14,99 @@ suppliers, not their history.
 
 Write-audit-publish: every table is first defined as a temporary view, the checks run on the views, and the gold
 tables are replaced only when no blocking check fails. A failed check leaves the previous gold tables in place.
+
+The task skips the rebuild when silver and ref have not changed since the last gold build (ops.build_state);
+job parameter rebuild=true forces it, for example after a code change.
 """
+
 import argparse
 
 SCHEMA = "gold"
 UNKNOWN = "-1"
-SERVICE_ARRAYS = ["hotelservice", "transferservice", "transportservice", "ticketservice", "closedtourservice",
-                  "carservice", "insuranceservice", "cruiseservice", "itemservice"]
-MANUAL_KEYS = ["hotel", "transfer", "transport", "ticket", "closedTour", "carRental", "cruise", "insurance",
-               "other", "accountingAdjustment"]
-CATEGORY = {"hotelservice": "Hotel", "transferservice": "Transfer", "transportservice": "Transport",
-            "ticketservice": "Ticket", "closedtourservice": "Closed tour", "carservice": "Car rental",
-            "insuranceservice": "Insurance", "cruiseservice": "Cruise", "itemservice": "Item",
-            "manual_hotel": "Hotel", "manual_transfer": "Transfer", "manual_transport": "Transport",
-            "manual_ticket": "Ticket", "manual_closedTour": "Closed tour", "manual_carRental": "Car rental",
-            "manual_cruise": "Cruise", "manual_insurance": "Insurance", "manual_other": "Other",
-            "manual_accountingAdjustment": "Accounting adjustment"}
+SERVICE_ARRAYS = [
+    "hotelservice",
+    "transferservice",
+    "transportservice",
+    "ticketservice",
+    "closedtourservice",
+    "carservice",
+    "insuranceservice",
+    "cruiseservice",
+    "itemservice",
+]
+MANUAL_KEYS = [
+    "hotel",
+    "transfer",
+    "transport",
+    "ticket",
+    "closedTour",
+    "carRental",
+    "cruise",
+    "insurance",
+    "other",
+    "accountingAdjustment",
+]
+CATEGORY = {
+    "hotelservice": "Hotel",
+    "transferservice": "Transfer",
+    "transportservice": "Transport",
+    "ticketservice": "Ticket",
+    "closedtourservice": "Closed tour",
+    "carservice": "Car rental",
+    "insuranceservice": "Insurance",
+    "cruiseservice": "Cruise",
+    "itemservice": "Item",
+    "manual_hotel": "Hotel",
+    "manual_transfer": "Transfer",
+    "manual_transport": "Transport",
+    "manual_ticket": "Ticket",
+    "manual_closedTour": "Closed tour",
+    "manual_carRental": "Car rental",
+    "manual_cruise": "Cruise",
+    "manual_insurance": "Insurance",
+    "manual_other": "Other",
+    "manual_accountingAdjustment": "Accounting adjustment",
+}
 # Order matters: dimensions first, then facts, then the one big table built on them.
-TABLES = ["dim_date", "dim_agency", "dim_supplier", "dim_service_type", "fact_booking", "fact_booking_service",
-          "obt_booking_service"]
+TABLES = [
+    "dim_date",
+    "dim_agency",
+    "dim_supplier",
+    "dim_service_type",
+    "fact_booking",
+    "fact_booking_service",
+    "obt_booking_service",
+]
 PII_TABLES = ["dim_agency", "dim_supplier", "obt_booking_service"]
 ACTIVE = "('BOOKED', 'RQ')"
 
 
 def supplier_key_sql(alias: str) -> str:
-    """Same supplier key as bc_tables.py uses for vendor numbers, so both outputs agree."""
-    return (f"CASE WHEN {alias}.supplier_id IS NOT NULL THEN 'SP' || {alias}.supplier_id "
-            f"WHEN NOT {alias}.is_manual AND {alias}.provider IS NOT NULL THEN 'PV' || {alias}.provider "
-            f"WHEN nullif(trim({alias}.supplier_name), '') IS NOT NULL THEN 'MN:' || lower(trim({alias}.supplier_name)) "
-            f"ELSE '{UNKNOWN}' END")
+    """Same SP and PV numbers as the vendor numbers of bc_tables.py, before any ref.vendor_map override."""
+    return (
+        f"CASE WHEN {alias}.supplier_id IS NOT NULL THEN 'SP' || {alias}.supplier_id "
+        f"WHEN NOT {alias}.is_manual AND {alias}.provider IS NOT NULL "
+        f"THEN left('PV' || regexp_replace({alias}.provider, '[^A-Z0-9]', ''), 20) "
+        f"WHEN nullif(trim({alias}.supplier_name), '') IS NOT NULL THEN 'MN:' || lower(trim({alias}.supplier_name)) "
+        f"ELSE '{UNKNOWN}' END"
+    )
+
+
+def silver_unchanged(sql, c: str, task: str, rebuild: str) -> tuple[bool, str]:
+    """True when silver and ref have not changed since this task last built; also returns the current token."""
+    sql(f"""CREATE TABLE IF NOT EXISTS {c}.ops.build_state (
+        task STRING, run_id STRING, built_at TIMESTAMP, silver_token STRING)""")
+    last = {
+        r["task"]: r["t"]
+        for r in sql(f"""SELECT task, max_by(silver_token, built_at) AS t
+        FROM {c}.ops.build_state WHERE task IN ('bronze_silver', '{task}') GROUP BY task""").collect()
+    }
+    token = last.get("bronze_silver") or ""
+    return (rebuild.lower() != "true" and token != "" and last.get(task) == token), token
+
+
+def record_build(sql, c: str, task: str, run_id: str, token: str) -> None:
+    sql(f"INSERT INTO {c}.ops.build_state SELECT '{task}', '{run_id}', current_timestamp(), '{token}'")
 
 
 def main():
@@ -51,11 +115,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--catalog", default="vio_travel")
     ap.add_argument("--run_id", default="")
+    ap.add_argument("--rebuild", default="false", help="true: rebuild even when silver has not changed")
     a = ap.parse_args()
     spark = SparkSession.builder.getOrCreate()
     c = a.catalog
     sql = spark.sql
     s = f"{c}.silver"
+    unchanged, token = silver_unchanged(sql, c, "star_schema", a.rebuild)
+    if unchanged:
+        print("silver and ref unchanged since the last gold build, nothing to do")
+        return
 
     # ---------------- dimensions ----------------------------------------------------------------
     sql("""CREATE OR REPLACE TEMP VIEW v_dim_date AS
@@ -84,7 +153,7 @@ def main():
         FROM {s}.suppliers p
         UNION ALL
         SELECT k, max(src), max(name), NULL, NULL, NULL, max(sid), max(prov) FROM (
-          SELECT {supplier_key_sql('x')} AS k,
+          SELECT {supplier_key_sql("x")} AS k,
                  CASE WHEN x.supplier_id IS NOT NULL THEN 'Travel Compositor supplier'
                       WHEN NOT x.is_manual AND x.provider IS NOT NULL THEN 'Provider'
                       WHEN x.is_manual THEN 'Manual service' ELSE 'Supplier name only' END AS src,
@@ -123,19 +192,26 @@ def main():
     # Destination of each service, read from the booking payload (hotel, ticket, transfer, transport and
     # manual services carry a country code; hotels also carry a destination name).
     dest = " UNION ALL ".join(
-        [f"""SELECT b.booking_ref, '{t}' AS service_type, x.value:id::string AS id,
+        [
+            f"""SELECT b.booking_ref, '{t}' AS service_type, x.value:id::string AS id,
                     x.value:country::string AS country,
                     coalesce(x.value:destinationName::string, x.value:locationName::string) AS dname
-             FROM {s}.bookings b, LATERAL variant_explode(b.payload:{t}) x""" for t in SERVICE_ARRAYS]
-        + [f"""SELECT b.booking_ref, 'manual_{k}', x.value:id::string, x.value:country::string,
+             FROM {s}.bookings b, LATERAL variant_explode(b.payload:{t}) x"""
+            for t in SERVICE_ARRAYS
+        ]
+        + [
+            f"""SELECT b.booking_ref, 'manual_{k}', x.value:id::string, x.value:country::string,
                     x.value:destination::string
-             FROM {s}.bookings b, LATERAL variant_explode(b.payload:manualServices.{k}) x""" for k in MANUAL_KEYS])
+             FROM {s}.bookings b, LATERAL variant_explode(b.payload:manualServices.{k}) x"""
+            for k in MANUAL_KEYS
+        ]
+    )
     sql(f"""CREATE OR REPLACE TEMP VIEW v_service_destination AS
         SELECT booking_ref, service_type, id, max(upper(country)) AS country, max(initcap(dname)) AS destination_name
         FROM ({dest}) WHERE id IS NOT NULL GROUP BY 1, 2, 3""")
     sql(f"""CREATE OR REPLACE TEMP VIEW v_fact_booking_service AS
         SELECT x.booking_ref || '|' || x.service_type || '|' || x.service_id AS service_key,
-               x.booking_ref, x.service_id, x.service_type, {supplier_key_sql('x')} AS supplier_key,
+               x.booking_ref, x.service_id, x.service_type, {supplier_key_sql("x")} AS supplier_key,
                coalesce(b.agency_id, '{UNKNOWN}') AS agency_key,
                CAST(date_format(b.created_at, 'yyyyMMdd') AS INT) AS booking_created_date_key,
                CAST(date_format(x.start_date, 'yyyyMMdd') AS INT) AS service_start_date_key,
@@ -168,34 +244,74 @@ def main():
 
     # ---------------- audit: checks on the views before anything is replaced -------------------
     checks = {
-        "gold_dim_agency_key_unique": ("block", "SELECT agency_key AS k FROM v_dim_agency GROUP BY 1 HAVING count(*) > 1"),
-        "gold_dim_supplier_key_unique": ("block",
-                                         "SELECT supplier_key AS k FROM v_dim_supplier GROUP BY 1 HAVING count(*) > 1"),
-        "gold_fact_booking_grain": ("block", "SELECT booking_ref AS k FROM v_fact_booking GROUP BY 1 HAVING count(*) > 1"),
-        "gold_fact_service_grain": ("block",
-                                    "SELECT service_key AS k FROM v_fact_booking_service GROUP BY 1 HAVING count(*) > 1"),
-        "gold_fact_without_agency": ("block", """SELECT booking_ref AS k FROM v_fact_booking f
-            LEFT ANTI JOIN v_dim_agency d ON d.agency_key = f.agency_key"""),
-        "gold_fact_without_supplier": ("block", """SELECT service_key AS k FROM v_fact_booking_service f
-            LEFT ANTI JOIN v_dim_supplier d ON d.supplier_key = f.supplier_key"""),
-        "gold_fact_without_service_type": ("block", """SELECT service_key AS k FROM v_fact_booking_service f
-            LEFT ANTI JOIN v_dim_service_type d ON d.service_type = f.service_type"""),
-        "gold_fact_date_out_of_range": ("block", """SELECT booking_ref AS k FROM v_fact_booking f
-            LEFT ANTI JOIN v_dim_date d ON d.date_key = f.created_date_key"""),
+        "gold_dim_agency_key_unique": (
+            "block",
+            "SELECT agency_key AS k FROM v_dim_agency GROUP BY 1 HAVING count(*) > 1",
+        ),
+        "gold_dim_supplier_key_unique": (
+            "block",
+            "SELECT supplier_key AS k FROM v_dim_supplier GROUP BY 1 HAVING count(*) > 1",
+        ),
+        "gold_fact_booking_grain": (
+            "block",
+            "SELECT booking_ref AS k FROM v_fact_booking GROUP BY 1 HAVING count(*) > 1",
+        ),
+        "gold_fact_service_grain": (
+            "block",
+            "SELECT service_key AS k FROM v_fact_booking_service GROUP BY 1 HAVING count(*) > 1",
+        ),
+        "gold_fact_without_agency": (
+            "block",
+            """SELECT booking_ref AS k FROM v_fact_booking f
+            LEFT ANTI JOIN v_dim_agency d ON d.agency_key = f.agency_key""",
+        ),
+        "gold_fact_without_supplier": (
+            "block",
+            """SELECT service_key AS k FROM v_fact_booking_service f
+            LEFT ANTI JOIN v_dim_supplier d ON d.supplier_key = f.supplier_key""",
+        ),
+        "gold_fact_without_service_type": (
+            "block",
+            """SELECT service_key AS k FROM v_fact_booking_service f
+            LEFT ANTI JOIN v_dim_service_type d ON d.service_type = f.service_type""",
+        ),
+        "gold_fact_date_out_of_range": (
+            "block",
+            """SELECT booking_ref AS k FROM v_fact_booking f
+            LEFT ANTI JOIN v_dim_date d ON d.date_key = f.created_date_key""",
+        ),
         # the model must keep every booking and service of silver, and the same revenue
-        "gold_booking_count_matches_silver": ("block", f"""SELECT 'fact_booking' AS k FROM (SELECT 1)
-            WHERE (SELECT count(*) FROM v_fact_booking) <> (SELECT count(*) FROM {s}.bookings)"""),
-        "gold_service_count_matches_silver": ("block", f"""SELECT 'fact_booking_service' AS k FROM (SELECT 1)
-            WHERE (SELECT count(*) FROM v_fact_booking_service) <> (SELECT count(*) FROM {s}.booking_services)"""),
-        "gold_revenue_matches_silver": ("block", f"""SELECT 'total_price' AS k FROM (SELECT 1)
+        "gold_booking_count_matches_silver": (
+            "block",
+            f"""SELECT 'fact_booking' AS k FROM (SELECT 1)
+            WHERE (SELECT count(*) FROM v_fact_booking) <> (SELECT count(*) FROM {s}.bookings)""",
+        ),
+        "gold_service_count_matches_silver": (
+            "block",
+            f"""SELECT 'fact_booking_service' AS k FROM (SELECT 1)
+            WHERE (SELECT count(*) FROM v_fact_booking_service) <> (SELECT count(*) FROM {s}.booking_services)""",
+        ),
+        "gold_revenue_matches_silver": (
+            "block",
+            f"""SELECT 'total_price' AS k FROM (SELECT 1)
             WHERE abs((SELECT coalesce(sum(total_price), 0) FROM v_fact_booking)
-                    - (SELECT coalesce(sum(total_price), 0) FROM {s}.bookings)) > 0.01"""),
-        "gold_obt_row_count": ("block", """SELECT 'obt_booking_service' AS k FROM (SELECT 1)
-            WHERE (SELECT count(*) FROM v_obt_booking_service) <> (SELECT count(*) FROM v_fact_booking_service)"""),
-        "gold_service_without_destination": ("warn", """SELECT service_key AS k FROM v_fact_booking_service
-            WHERE destination_country IS NULL AND is_active"""),
-        "gold_supplier_unknown": ("warn", f"""SELECT service_key AS k FROM v_fact_booking_service
-            WHERE supplier_key = '{UNKNOWN}' AND is_active"""),
+                    - (SELECT coalesce(sum(total_price), 0) FROM {s}.bookings)) > 0.01""",
+        ),
+        "gold_obt_row_count": (
+            "block",
+            """SELECT 'obt_booking_service' AS k FROM (SELECT 1)
+            WHERE (SELECT count(*) FROM v_obt_booking_service) <> (SELECT count(*) FROM v_fact_booking_service)""",
+        ),
+        "gold_service_without_destination": (
+            "warn",
+            """SELECT service_key AS k FROM v_fact_booking_service
+            WHERE destination_country IS NULL AND is_active""",
+        ),
+        "gold_supplier_unknown": (
+            "warn",
+            f"""SELECT service_key AS k FROM v_fact_booking_service
+            WHERE supplier_key = '{UNKNOWN}' AND is_active""",
+        ),
     }
     sql(f"""CREATE TABLE IF NOT EXISTS {c}.ops.dq_results (
         run_id STRING, checked_at TIMESTAMP, check_name STRING, severity STRING, failed_rows BIGINT, sample STRING)""")
@@ -206,22 +322,27 @@ def main():
         print(f"DQ {severity:5} {name}: {r['n']} sample={r['s']}")
         if r["n"] and severity == "block":
             blocked.append(name)
-    spark.createDataFrame(rows_out, "run_id STRING, check_name STRING, severity STRING, failed_rows BIGINT, "
-                                    "sample STRING") \
-        .selectExpr("run_id", "current_timestamp() AS checked_at", "check_name", "severity", "failed_rows", "sample") \
-        .write.mode("append").saveAsTable(f"{c}.ops.dq_results")
+    spark.createDataFrame(
+        rows_out, "run_id STRING, check_name STRING, severity STRING, failed_rows BIGINT, sample STRING"
+    ).selectExpr(
+        "run_id", "current_timestamp() AS checked_at", "check_name", "severity", "failed_rows", "sample"
+    ).write.mode("append").saveAsTable(f"{c}.ops.dq_results")
     if blocked:
         raise RuntimeError(f"blocking data-quality checks failed, gold tables left unchanged: {blocked}")
 
     # ---------------- publish: replace the gold tables from the checked views -------------------
-    cluster = {"fact_booking": "booking_ref", "fact_booking_service": "booking_ref",
-               "obt_booking_service": "booking_created_month"}
+    cluster = {
+        "fact_booking": "booking_ref",
+        "fact_booking_service": "booking_ref",
+        "obt_booking_service": "booking_created_month",
+    }
     for t in TABLES:
         by = f" CLUSTER BY ({cluster[t]})" if t in cluster else ""
         sql(f"CREATE OR REPLACE TABLE {c}.{SCHEMA}.{t}{by} AS SELECT * FROM v_{t}")
         print(t, sql(f"SELECT count(*) FROM {c}.{SCHEMA}.{t}").collect()[0][0])
     for t in PII_TABLES:
         sql(f"ALTER TABLE {c}.{SCHEMA}.{t} SET TAGS ('contains_pii' = 'true')")
+    record_build(sql, c, "star_schema", a.run_id, token)
 
 
 if __name__ == "__main__":

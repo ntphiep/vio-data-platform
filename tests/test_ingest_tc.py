@@ -1,4 +1,5 @@
 """Unit tests for the extract helpers. Run: uv run --no-project --with pytest --with requests pytest pipeline/tests"""
+
 import datetime as dt
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ class Resp:
 
     def json(self):
         import json
+
         return json.loads(self.content)
 
     def raise_for_status(self):
@@ -44,8 +46,9 @@ class Session:
 def client(gets):
     sleeps, logs = [], []
     s = Session(gets)
-    tc = m.TravelCompositor("https://x/resources", "u", "p", "ms", lambda *a: logs.append(a), session=s,
-                            sleep=sleeps.append)
+    tc = m.TravelCompositor(
+        "https://x/resources", "u", "p", "ms", lambda *a: logs.append(a), session=s, sleep=sleeps.append
+    )
     return tc, s, sleeps, logs
 
 
@@ -53,7 +56,7 @@ def test_retry_on_429_honours_retry_after():
     tc, s, sleeps, logs = client([Resp(429, headers={"Retry-After": "7"}), Resp(200, b'{"ok": 1}')])
     assert tc.get("/p") == {"ok": 1}
     assert sleeps == [7.0]
-    assert [l[2] for l in logs] == [429, 200]
+    assert [row[2] for row in logs] == [429, 200]
 
 
 def test_retry_on_5xx_and_network_error_then_success():
@@ -98,18 +101,27 @@ def test_token_renewed_before_expiry(monkeypatch):
 
 def test_day_windows_cover_range_without_gaps():
     w = m.day_windows(dt.date(2026, 1, 1), dt.date(2026, 1, 20), 7)
-    assert w == [(dt.date(2026, 1, 1), dt.date(2026, 1, 7)), (dt.date(2026, 1, 8), dt.date(2026, 1, 14)),
-                 (dt.date(2026, 1, 15), dt.date(2026, 1, 20))]
+    assert w == [
+        (dt.date(2026, 1, 1), dt.date(2026, 1, 7)),
+        (dt.date(2026, 1, 8), dt.date(2026, 1, 14)),
+        (dt.date(2026, 1, 15), dt.date(2026, 1, 20)),
+    ]
     assert m.day_windows(dt.date(2026, 1, 1), dt.date(2026, 1, 1), 7) == [(dt.date(2026, 1, 1),) * 2]
 
 
 def test_page_bookings_reports_shortfall_when_offset_shifts():
     # totalResults says 3, but a change between pages makes booking B appear twice and C never.
-    pages = [Resp(200, b'{"pagination": {"totalResults": 3}, "bookedTrip": [{"bookingReference": "A"},'
-                       b' {"bookingReference": "B"}]}'),
-             Resp(200, b'{"pagination": {"totalResults": 3}, "bookedTrip": [{"bookingReference": "B"}]}')]
+    pages = [
+        Resp(
+            200,
+            b'{"pagination": {"totalResults": 3}, "bookedTrip": [{"bookingReference": "A"},'
+            b' {"bookingReference": "B"}]}',
+        ),
+        Resp(200, b'{"pagination": {"totalResults": 3}, "bookedTrip": [{"bookingReference": "B"}]}'),
+    ]
     tc, *_ = client(pages)
     landed = []
-    p, r, b, refs, total = m.page_bookings(tc, (dt.date(2026, 1, 1), dt.date(2026, 1, 2)), 2,
-                                           lambda recs, meta: landed.append(recs) or 10)
+    p, r, b, refs, total = m.page_bookings(
+        tc, (dt.date(2026, 1, 1), dt.date(2026, 1, 2)), 2, lambda recs, meta: landed.append(recs) or 10
+    )
     assert (p, r, total) == (2, 3, 3) and refs == {"A", "B"} and len(refs) < total

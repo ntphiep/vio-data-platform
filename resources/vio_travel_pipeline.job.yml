@@ -1,17 +1,20 @@
 resources:
   jobs:
-    vio_tc_to_bc:
-      name: vio_tc_to_bc
+    vio_travel_pipeline:
+      name: vio_travel_pipeline
       description: >-
         Travel Compositor API -> volume raw.landing -> bronze -> silver, then two outputs built in parallel from
-        silver: the star schema in gold (read by the dashboard vio_travel_overview) and the Business Central
-        integration tables in business_central (published only after the blocking data-quality checks pass,
-        then pushed by local/push_to_bc.py outside Databricks because it uses a delegated Azure CLI login).
+        silver when it changed: the star schema in gold (read by the dashboard vio_travel_overview) and the
+        Business Central integration tables in business_central (published only after the blocking data-quality
+        checks pass, then pushed by local/push_to_bc.py outside Databricks because it uses a delegated Azure CLI
+        login). The last task, data_quality, checks that every stage is up to date with the one before it.
       max_concurrent_runs: 1
       timeout_seconds: 7200
       queue: {enabled: true}
       schedule:
-        quartz_cron_expression: "0 5 * * * ?"   # every hour at minute 05
+        # every 30 minutes, at minute 05 and 35; star_schema and bc_tables skip the rebuild when silver did not
+        # change, so night runs stay short (Free Edition has a daily compute quota)
+        quartz_cron_expression: "0 5/30 * * * ?"
         timezone_id: Asia/Ho_Chi_Minh
         pause_status: UNPAUSED
       health:
@@ -29,6 +32,8 @@ resources:
         - name: backfill_from
           default: ""
         - name: full_refresh
+          default: "false"
+        - name: rebuild
           default: "false"
       environments:
         - environment_key: default
@@ -60,7 +65,8 @@ resources:
           max_retries: 1
           spark_python_task:
             python_file: ../src/star_schema.py
-            parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}"]
+            parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}",
+                         "--rebuild", "{{job.parameters.rebuild}}"]
         - task_key: bc_tables
           depends_on:
             - task_key: bronze_silver
@@ -68,4 +74,14 @@ resources:
           max_retries: 1
           spark_python_task:
             python_file: ../src/bc_tables.py
+            parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}",
+                         "--rebuild", "{{job.parameters.rebuild}}"]
+        - task_key: data_quality
+          depends_on:
+            - task_key: star_schema
+            - task_key: bc_tables
+          run_if: ALL_DONE          # also after a failed task, so the end-to-end state is always recorded
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/data_quality.py
             parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}"]

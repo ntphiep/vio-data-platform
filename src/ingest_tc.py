@@ -19,6 +19,7 @@ Design
 
 Parameters: --catalog --page_size --window_days --overlap_days --backfill_from --retention_days --ref_refresh_hours
 """
+
 import argparse
 import datetime as dt
 import gzip
@@ -43,7 +44,7 @@ def backoff_seconds(attempt, retry_after=None):
             return min(MAX_SLEEP, max(1.0, float(retry_after)))
         except ValueError:
             pass
-    return random.uniform(1, min(MAX_SLEEP, 2 ** attempt))
+    return random.uniform(1, min(MAX_SLEEP, 2**attempt))  # noqa: S311 - backoff jitter, not security
 
 
 def day_windows(start, end, days):
@@ -64,8 +65,11 @@ class TravelCompositor:
         self.token, self.token_expires = None, 0.0
 
     def _authenticate(self):
-        r = self.s.post(f"{self.base}/authentication/authenticate", timeout=API_TIMEOUT,
-                        json={"username": self.user, "password": self.pwd, "micrositeId": self.ms})
+        r = self.s.post(
+            f"{self.base}/authentication/authenticate",
+            timeout=API_TIMEOUT,
+            json={"username": self.user, "password": self.pwd, "micrositeId": self.ms},
+        )
         r.raise_for_status()
         d = r.json()
         self.token = d["token"]
@@ -79,8 +83,12 @@ class TravelCompositor:
             try:
                 if not self.token or time.time() >= self.token_expires:
                     self._authenticate()
-                r = self.s.get(f"{self.base}{path}", params=params, timeout=API_TIMEOUT,
-                               headers={"auth-token": self.token, "Accept-Encoding": "gzip"})
+                r = self.s.get(
+                    f"{self.base}{path}",
+                    params=params,
+                    timeout=API_TIMEOUT,
+                    headers={"auth-token": self.token, "Accept-Encoding": "gzip"},
+                )
                 status, body, retry_after = r.status_code, r.content, r.headers.get("Retry-After")
             except requests.RequestException as e:
                 err = type(e).__name__ + ": " + str(e)[:300]
@@ -107,17 +115,25 @@ def page_bookings(tc, window, page_size, land):
     ufrom, uto = window
     first, pages, records, nbytes, total, refs = 0, 0, 0, 0, None, set()
     while total is None or first < total:
-        params = {"microsite": tc.ms, "from": "20150101", "to": dt.date.today().strftime("%Y%m%d"),
-                  "ufrom": ufrom.strftime("%Y%m%d"), "uto": uto.strftime("%Y%m%d"), "first": first,
-                  "limit": page_size}
+        params = {
+            "microsite": tc.ms,
+            "from": "20150101",
+            "to": dt.date.today().strftime("%Y%m%d"),
+            "ufrom": ufrom.strftime("%Y%m%d"),
+            "uto": uto.strftime("%Y%m%d"),
+            "first": first,
+            "limit": page_size,
+        }
         data = tc.get("/booking/getBookings", params)
         trips = data.get("bookedTrip") or []
         total = (data.get("pagination") or {}).get("totalResults", 0) if total is None else total
         if not trips:
             break
         pages += 1
-        nbytes += land(trips, {"endpoint": "/booking/getBookings", "ufrom": str(ufrom), "uto": str(uto),
-                               "first": first, "total": total})
+        nbytes += land(
+            trips,
+            {"endpoint": "/booking/getBookings", "ufrom": str(ufrom), "uto": str(uto), "first": first, "total": total},
+        )
         records += len(trips)
         refs.update(t.get("bookingReference") for t in trips)
         first += len(trips)
@@ -139,12 +155,13 @@ def main():
 
     spark = SparkSession.builder.getOrCreate()
     from pyspark.dbutils import DBUtils  # available on Databricks runtimes
+
     dbutils = DBUtils(spark)
     ops = f"{a.catalog}.ops"
     landing = f"/Volumes/{a.catalog}/raw/landing"
-    run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
+    run_id = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
     today = dt.date.today()
-    now = lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)  # noqa: E731
+    now = lambda: dt.datetime.now(dt.UTC).replace(tzinfo=None)  # noqa: E731
 
     spark.sql(f"""CREATE TABLE IF NOT EXISTS {ops}.api_calls (
         run_id STRING, called_at TIMESTAMP, path STRING, params STRING, status INT, bytes BIGINT,
@@ -177,30 +194,41 @@ def main():
                 f.write(data)
             os.replace(tmp, f"{folder}/page={counter['n']:05d}.ndjson.gz")  # Auto Loader only sees whole files
             return len(data)
+
         return land
 
     def flush():
         if calls:
-            spark.createDataFrame(calls, "run_id STRING, called_at TIMESTAMP, path STRING, params STRING, "
-                                         "status INT, bytes BIGINT, seconds DOUBLE, attempt INT, error STRING") \
-                .write.mode("append").saveAsTable(f"{ops}.api_calls")
+            spark.createDataFrame(
+                calls,
+                "run_id STRING, called_at TIMESTAMP, path STRING, params STRING, "
+                "status INT, bytes BIGINT, seconds DOUBLE, attempt INT, error STRING",
+            ).write.mode("append").saveAsTable(f"{ops}.api_calls")
             calls.clear()
         if summaries:
-            spark.createDataFrame(summaries, "run_id STRING, started_at TIMESTAMP, finished_at TIMESTAMP, "
-                                             "entity STRING, window_from DATE, window_to DATE, pages INT, "
-                                             "records INT, distinct_keys INT, expected INT, bytes BIGINT, "
-                                             "status STRING, error STRING") \
-                .write.mode("append").saveAsTable(f"{ops}.ingest_runs")
+            spark.createDataFrame(
+                summaries,
+                "run_id STRING, started_at TIMESTAMP, finished_at TIMESTAMP, "
+                "entity STRING, window_from DATE, window_to DATE, pages INT, "
+                "records INT, distinct_keys INT, expected INT, bytes BIGINT, "
+                "status STRING, error STRING",
+            ).write.mode("append").saveAsTable(f"{ops}.ingest_runs")
             for s in summaries:
-                print(f"{s[3]}: {s[11]} window={s[4]}..{s[5]} pages={s[6]} records={s[7]} distinct={s[8]} "
-                      f"expected={s[9]} bytes={s[10]} error={s[12]}")
+                print(
+                    f"{s[3]}: {s[11]} window={s[4]}..{s[5]} pages={s[6]} records={s[7]} distinct={s[8]} "
+                    f"expected={s[9]} bytes={s[10]} error={s[12]}"
+                )
             done.extend(summaries)
             summaries.clear()
 
     done = []
-    tc = TravelCompositor(dbutils.secrets.get("vio-tc", "tc_base_url"), dbutils.secrets.get("vio-tc", "tc_username"),
-                          dbutils.secrets.get("vio-tc", "tc_password"),
-                          dbutils.secrets.get("vio-tc", "tc_microsite_id"), log)
+    tc = TravelCompositor(
+        dbutils.secrets.get("vio-tc", "tc_base_url"),
+        dbutils.secrets.get("vio-tc", "tc_username"),
+        dbutils.secrets.get("vio-tc", "tc_password"),
+        dbutils.secrets.get("vio-tc", "tc_microsite_id"),
+        log,
+    )
 
     try:
         # --- bookings, incremental by last update date, window by window ----------------------
@@ -225,15 +253,31 @@ def main():
                         break
                 if len(refs) < total:
                     status, error = "PARTIAL", f"{len(refs)} distinct of {total} expected"
-            except Exception as e:  # keep what was landed, record the failure
+            except Exception as e:  # noqa: BLE001 - keep what was landed, record the failure
                 status, error = "FAILED", repr(e)[:1000]
-            summaries.append((run_id, t0, now(), "bookings", window[0], window[1], pages, records, len(refs),
-                              total, nbytes, status, error))
+            summaries.append(
+                (
+                    run_id,
+                    t0,
+                    now(),
+                    "bookings",
+                    window[0],
+                    window[1],
+                    pages,
+                    records,
+                    len(refs),
+                    total,
+                    nbytes,
+                    status,
+                    error,
+                )
+            )
             if status != "SUCCESS":
                 break  # later windows wait, the watermark stays at the last complete window
-            spark.createDataFrame([("bookings", window[1], now(), run_id)],
-                                  "entity STRING, watermark DATE, updated_at TIMESTAMP, run_id STRING") \
-                .write.mode("append").saveAsTable(f"{ops}.watermark")
+            spark.createDataFrame(
+                [("bookings", window[1], now(), run_id)],
+                "entity STRING, watermark DATE, updated_at TIMESTAMP, run_id STRING",
+            ).write.mode("append").saveAsTable(f"{ops}.watermark")
             flush()
 
         # --- reference data: full snapshot every --ref_refresh_hours -------------------------
@@ -267,10 +311,11 @@ def main():
                         first += len(rows)
                 if len(keys) < (total or 0):
                     st, err = "PARTIAL", f"{len(keys)} distinct of {total} expected"
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - record the failure, the next run retries
                 st, err = "FAILED", repr(e)[:1000]
-            summaries.append((run_id, t0, now(), entity, today, today, pages, records, len(keys), total or 0,
-                              nbytes, st, err))
+            summaries.append(
+                (run_id, t0, now(), entity, today, today, pages, records, len(keys), total or 0, nbytes, st, err)
+            )
             flush()
 
         # --- retention of landing files ------------------------------------------------------
@@ -278,7 +323,7 @@ def main():
         for entity in ("bookings", "agencies", "suppliers"):
             base = f"{landing}/{entity}"
             for d in os.listdir(base) if os.path.isdir(base) else []:
-                if d.startswith("ingest_date=") and d[len("ingest_date="):] < cutoff.isoformat():
+                if d.startswith("ingest_date=") and d[len("ingest_date=") :] < cutoff.isoformat():
                     shutil.rmtree(f"{base}/{d}")
                     print(f"retention: removed {base}/{d}")
     finally:

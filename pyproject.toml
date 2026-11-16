@@ -1,0 +1,25 @@
+# Tooling only: the job tasks run as plain Python files on Databricks serverless, and local/push_to_bc.py runs
+# with `uv run --no-project`, so this file declares no package and no dependencies.
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+# Databricks injects these names into job tasks
+builtins = ["spark", "dbutils", "display"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "BLE"]
+ignore = [
+    "E501",  # ruff format keeps code at 120 columns; long lines left are SQL inside strings
+    "S608",  # SQL is built from fixed table names and catalog parameters, never from user input
+    "S603",  # subprocess calls use fixed argument lists (az CLI)
+    "S607",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

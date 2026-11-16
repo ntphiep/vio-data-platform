@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    env:
+      # repository secrets; the bundle steps are skipped while they are not set
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: ruff lint
+        run: uvx ruff check .
+      - name: ruff format
+        run: uvx ruff format --check .
+      - name: unit tests
+        run: uv run --no-project --with pytest --with requests pytest -q tests
+      - name: dashboard JSON matches its generator
+        run: python3 dashboards/build_dashboard.py && git diff --exit-code dashboards/
+      - name: install Databricks CLI
+        if: ${{ env.DATABRICKS_TOKEN != '' }}
+        uses: databricks/setup-cli@main
+      - name: bundle validate
+        if: ${{ env.DATABRICKS_TOKEN != '' }}
+        run: databricks bundle validate -t prod

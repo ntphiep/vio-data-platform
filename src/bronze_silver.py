@@ -9,19 +9,78 @@ silver.agencies, silver.suppliers
                       latest complete snapshot of the reference data
 ref.*                 mapping tables maintained by Vio Finance (created empty here)
 
+ops.build_state       content token of silver and ref after this run; star_schema.py and bc_tables.py compare it
+                      with the token of their own last build and skip the rebuild when nothing changed
+
 Downstream tasks star_schema.py (analytics model) and bc_tables.py (integration output) read silver.
 """
+
 import argparse
+import hashlib
 import shutil
 
-SERVICE_ARRAYS = ["hotelservice", "transferservice", "transportservice", "ticketservice", "closedtourservice",
-                  "carservice", "insuranceservice", "cruiseservice", "itemservice"]
-MANUAL_KEYS = ["hotel", "transfer", "transport", "ticket", "closedTour", "carRental", "cruise", "insurance",
-               "other", "accountingAdjustment"]
-PII_TABLES = ["bronze.tc_bookings", "bronze.tc_agencies", "bronze.tc_suppliers", "silver.bookings",
-              "silver.agencies", "silver.suppliers"]
-OWNED_FOR_REPLAY = ["bronze.tc_bookings", "bronze.tc_agencies", "bronze.tc_suppliers", "silver.bookings",
-                    "silver.booking_services", "ops.silver_progress"]
+SERVICE_ARRAYS = [
+    "hotelservice",
+    "transferservice",
+    "transportservice",
+    "ticketservice",
+    "closedtourservice",
+    "carservice",
+    "insuranceservice",
+    "cruiseservice",
+    "itemservice",
+]
+MANUAL_KEYS = [
+    "hotel",
+    "transfer",
+    "transport",
+    "ticket",
+    "closedTour",
+    "carRental",
+    "cruise",
+    "insurance",
+    "other",
+    "accountingAdjustment",
+]
+PII_TABLES = [
+    "bronze.tc_bookings",
+    "bronze.tc_agencies",
+    "bronze.tc_suppliers",
+    "silver.bookings",
+    "silver.agencies",
+    "silver.suppliers",
+]
+OWNED_FOR_REPLAY = [
+    "bronze.tc_bookings",
+    "bronze.tc_agencies",
+    "bronze.tc_suppliers",
+    "silver.bookings",
+    "silver.booking_services",
+    "ops.silver_progress",
+]
+
+
+def silver_token(sql, c: str, extra: str = "") -> str:
+    """Token that changes only when the data read by star_schema and bc_tables changes.
+
+    Bookings: row count and a hash of every (booking_ref, last_update_at); services change only with their booking.
+    Agencies and suppliers: the snapshot run. Ref tables: their Delta version, which changes only on an edit.
+    """
+    parts = [
+        str(
+            sql(f"""SELECT count(*) || ':' || coalesce(sum(CAST(xxhash64(booking_ref, last_update_at) AS DECIMAL(38, 0))), 0)
+                         FROM {c}.silver.bookings""").first()[0]
+        )
+    ]
+    parts += [
+        str(sql(f"SELECT coalesce(max(run_id), '') FROM {c}.silver.{t}").first()[0]) for t in ("agencies", "suppliers")
+    ]
+    parts += [
+        str(sql(f"DESCRIBE HISTORY {c}.ref.{t} LIMIT 1").first()["version"])
+        for t in ("umbrella_agency", "customer_map", "vendor_map")
+    ]
+    return hashlib.sha256("|".join(parts + [extra]).encode()).hexdigest()
+
 
 def main():
     from pyspark.sql import SparkSession
@@ -47,20 +106,30 @@ def main():
 
     # ---------------- bronze: Auto Loader, exactly-once file tracking via checkpoint ------------
     for entity in ("bookings", "agencies", "suppliers"):
-        (spark.readStream.format("cloudFiles")
-         .option("cloudFiles.format", "text")
-         .option("pathGlobFilter", "*.ndjson.gz")
-         .load(f"{vol}/{entity}")
-         .selectExpr("try_parse_json(value) AS doc", "value AS raw_line", "_metadata.file_path AS source_file",
-                     "current_timestamp() AS ingested_at")
-         # A malformed line is kept with doc = NULL and its text, so one bad line never stops the stream.
-         .selectExpr("doc", "CASE WHEN doc IS NULL THEN raw_line END AS bad_line",
-                     "doc:_meta.run_id::string AS run_id", "source_file", "ingested_at")
-         .writeStream
-         .option("checkpointLocation", f"{chk}/bronze_tc_{entity}")
-         .trigger(availableNow=True)
-         .toTable(f"{c}.bronze.tc_{entity}")
-         .awaitTermination())
+        (
+            spark.readStream.format("cloudFiles")
+            .option("cloudFiles.format", "text")
+            .option("pathGlobFilter", "*.ndjson.gz")
+            .load(f"{vol}/{entity}")
+            .selectExpr(
+                "try_parse_json(value) AS doc",
+                "value AS raw_line",
+                "_metadata.file_path AS source_file",
+                "current_timestamp() AS ingested_at",
+            )
+            # A malformed line is kept with doc = NULL and its text, so one bad line never stops the stream.
+            .selectExpr(
+                "doc",
+                "CASE WHEN doc IS NULL THEN raw_line END AS bad_line",
+                "doc:_meta.run_id::string AS run_id",
+                "source_file",
+                "ingested_at",
+            )
+            .writeStream.option("checkpointLocation", f"{chk}/bronze_tc_{entity}")
+            .trigger(availableNow=True)
+            .toTable(f"{c}.bronze.tc_{entity}")
+            .awaitTermination()
+        )
 
     # ---------------- silver: bookings (current state) ------------------------------------------
     sql(f"""CREATE TABLE IF NOT EXISTS {c}.silver.bookings (
@@ -74,8 +143,9 @@ def main():
     sql(f"CREATE TABLE IF NOT EXISTS {c}.ops.silver_progress (processed_until TIMESTAMP, run_id STRING)")
     # Bronze rows not merged yet. The upper bound is fixed before reading, so rows that arrive during this
     # run are picked up by the next run instead of being skipped.
-    lo = sql(f"SELECT coalesce(max(processed_until), TIMESTAMP'1970-01-01') AS t FROM {c}.ops.silver_progress"
-             ).collect()[0]["t"]
+    lo = sql(
+        f"SELECT coalesce(max(processed_until), TIMESTAMP'1970-01-01') AS t FROM {c}.ops.silver_progress"
+    ).collect()[0]["t"]
     hi = sql(f"SELECT max(ingested_at) AS t FROM {c}.bronze.tc_bookings").collect()[0]["t"] or lo
     sql(f"""CREATE OR REPLACE TEMP VIEW bookings_changed AS
         SELECT * FROM (
@@ -88,10 +158,13 @@ def main():
         ) WHERE rn = 1""")
     # Bookings whose incoming version is newer than silver. The 1-day overlap re-reads unchanged bookings
     # every run; they are skipped here, so their services are not rewritten.
-    changed = [r["ref"] for r in sql(f"""
+    changed = [
+        r["ref"]
+        for r in sql(f"""
         SELECT DISTINCT b.r:bookingReference::string AS ref FROM bookings_changed b
         LEFT JOIN {c}.silver.bookings t ON t.booking_ref = b.r:bookingReference::string
-        WHERE t.booking_ref IS NULL OR b.r:lastUpdateDate::timestamp > t.last_update_at""").collect()]
+        WHERE t.booking_ref IS NULL OR b.r:lastUpdateDate::timestamp > t.last_update_at""").collect()
+    ]
     spark.createDataFrame([(x,) for x in changed], "ref STRING").createOrReplaceTempView("changed_refs")
     print(f"bookings with a newer version in this batch: {len(changed)}")
     sql(f"""MERGE INTO {c}.silver.bookings t
@@ -128,11 +201,15 @@ def main():
     typed = " UNION ALL ".join(
         f"""SELECT b.booking_ref, '{t}' AS service_type, false AS is_manual, s.value AS s, b.last_update_at
             FROM {c}.silver.bookings b SEMI JOIN changed_refs x ON x.ref = b.booking_ref,
-            LATERAL variant_explode(b.payload:{t}) s""" for t in SERVICE_ARRAYS)
+            LATERAL variant_explode(b.payload:{t}) s"""
+        for t in SERVICE_ARRAYS
+    )
     manual = " UNION ALL ".join(
         f"""SELECT b.booking_ref, 'manual_{k}' AS service_type, true AS is_manual, s.value AS s, b.last_update_at
             FROM {c}.silver.bookings b SEMI JOIN changed_refs x ON x.ref = b.booking_ref,
-            LATERAL variant_explode(b.payload:manualServices.{k}) s""" for k in MANUAL_KEYS)
+            LATERAL variant_explode(b.payload:manualServices.{k}) s"""
+        for k in MANUAL_KEYS
+    )
     sql(f"""CREATE OR REPLACE TEMP VIEW services_changed AS
         SELECT booking_ref, coalesce(s:id::string, booking_ref || '-' || service_type) AS service_id, service_type,
                is_manual, s:status::string AS status,
@@ -188,7 +265,8 @@ def main():
                  doc:record.legalName::string AS legal_name, doc:record.active::boolean AS active,
                  doc:record.email::string AS email, doc:record.country.id::string AS country,
                  doc:record.taxpayerId::string AS tax_id, doc:record.phoneNumber::string AS phone,
-                 doc:record.address.address::string AS address"""}
+                 doc:record.address.address::string AS address""",
+    }
     for entity, cols in ref_cols.items():
         sql(f"""CREATE OR REPLACE TABLE {c}.silver.{entity} AS
             SELECT * EXCEPT (rn) FROM (
@@ -208,6 +286,14 @@ def main():
         note STRING)""")
     for t in PII_TABLES:
         sql(f"ALTER TABLE {c}.{t} SET TAGS ('contains_pii' = 'true')")
+
+    # ---------------- build state: what the downstream tasks will compare against ----------------
+    sql(f"""CREATE TABLE IF NOT EXISTS {c}.ops.build_state (
+        task STRING, run_id STRING, built_at TIMESTAMP, silver_token STRING)""")
+    # a full refresh rebuilds silver, so the token includes the run to force the downstream rebuild
+    token = silver_token(sql, c, a.run_id if a.full_refresh.lower() == "true" else "")
+    sql(f"INSERT INTO {c}.ops.build_state SELECT 'bronze_silver', '{a.run_id}', current_timestamp(), '{token}'")
+    print("silver token", token)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,2152 @@
+{
+  "datasets": [
+    {
+      "name": "booking_kpis",
+      "displayName": "booking_kpis",
+      "queryLines": [
+        "SELECT count_if(is_active) AS active_bookings,\n",
+        "sum(CASE WHEN is_active THEN total_price END) AS revenue_usd,\n",
+        "sum(CASE WHEN is_active THEN gross_margin END) AS gross_margin_usd,\n",
+        "count_if(is_cancelled) AS cancelled_bookings\n",
+        "FROM gold.fact_booking\n"
+      ]
+    },
+    {
+      "name": "bookings_by_created_month",
+      "displayName": "bookings_by_created_month",
+      "queryLines": [
+        "SELECT date_trunc('MONTH', d.date) AS created_month, f.status, count(*) AS bookings,\n",
+        "sum(f.total_price) AS revenue_usd\n",
+        "FROM gold.fact_booking f JOIN gold.dim_date d ON d.date_key = f.created_date_key\n",
+        "GROUP BY ALL\n"
+      ]
+    },
+    {
+      "name": "revenue_by_travel_month",
+      "displayName": "revenue_by_travel_month",
+      "queryLines": [
+        "SELECT date_trunc('MONTH', d.date) AS travel_month, sum(f.total_price) AS revenue_usd,\n",
+        "sum(f.gross_margin) AS gross_margin_usd\n",
+        "FROM gold.fact_booking f JOIN gold.dim_date d ON d.date_key = f.start_date_key\n",
+        "WHERE f.is_active\n",
+        "GROUP BY ALL\n"
+      ]
+    },
+    {
+      "name": "top_agencies",
+      "displayName": "top_agencies",
+      "queryLines": [
+        "SELECT a.agency_name, count(*) AS bookings, sum(f.total_price) AS revenue_usd\n",
+        "FROM gold.fact_booking f JOIN gold.dim_agency a ON a.agency_key = f.agency_key\n",
+        "WHERE f.is_active\n",
+        "GROUP BY ALL ORDER BY revenue_usd DESC LIMIT 15\n"
+      ]
+    },
+    {
+      "name": "bookings_by_trip_type",
+      "displayName": "bookings_by_trip_type",
+      "queryLines": [
+        "SELECT trip_type, count(*) AS bookings FROM gold.fact_booking WHERE is_active GROUP BY ALL\n"
+      ]
+    },
+    {
+      "name": "top_destinations",
+      "displayName": "top_destinations",
+      "queryLines": [
+        "SELECT destination_country, count(DISTINCT booking_ref) AS bookings, count(*) AS services,\n",
+        "sum(sale_amount) AS sale_usd\n",
+        "FROM gold.obt_booking_service\n",
+        "WHERE is_active AND booking_is_active AND destination_country IS NOT NULL\n",
+        "AND sale_currency = booking_currency\n",
+        "GROUP BY ALL ORDER BY bookings DESC LIMIT 20\n"
+      ]
+    },
+    {
+      "name": "supplier_kpis",
+      "displayName": "supplier_kpis",
+      "queryLines": [
+        "SELECT count(DISTINCT supplier_key) AS suppliers_used,\n",
+        "sum(cost_in_booking_currency) AS cost_usd,\n",
+        "sum(margin_in_booking_currency) / nullif(sum(CASE WHEN margin_in_booking_currency IS NOT NULL\n",
+        "THEN sale_amount END), 0) AS service_margin_pct\n",
+        "FROM gold.obt_booking_service WHERE is_active AND booking_is_active\n"
+      ]
+    },
+    {
+      "name": "cost_by_category",
+      "displayName": "cost_by_category",
+      "queryLines": [
+        "SELECT service_category, sum(cost_in_booking_currency) AS cost_usd,\n",
+        "sum(CASE WHEN sale_currency = booking_currency THEN sale_amount END) AS sale_usd\n",
+        "FROM gold.obt_booking_service WHERE is_active AND booking_is_active\n",
+        "GROUP BY ALL\n"
+      ]
+    },
+    {
+      "name": "top_suppliers",
+      "displayName": "top_suppliers",
+      "queryLines": [
+        "SELECT supplier_name, supplier_source, count(*) AS services, sum(cost_in_booking_currency) AS cost_usd\n",
+        "FROM gold.obt_booking_service WHERE is_active AND booking_is_active\n",
+        "GROUP BY ALL ORDER BY cost_usd DESC LIMIT 20\n"
+      ]
+    },
+    {
+      "name": "cost_by_destination_country",
+      "displayName": "cost_by_destination_country",
+      "queryLines": [
+        "SELECT destination_country, sum(cost_in_booking_currency) AS cost_usd\n",
+        "FROM gold.obt_booking_service\n",
+        "WHERE is_active AND booking_is_active AND destination_country IS NOT NULL\n",
+        "GROUP BY ALL ORDER BY cost_usd DESC LIMIT 15\n"
+      ]
+    },
+    {
+      "name": "supplier_source_mix",
+      "displayName": "supplier_source_mix",
+      "queryLines": [
+        "SELECT supplier_source, count(*) AS services, sum(cost_in_booking_currency) AS cost_usd\n",
+        "FROM gold.obt_booking_service WHERE is_active AND booking_is_active GROUP BY ALL\n"
+      ]
+    },
+    {
+      "name": "extract_runs",
+      "displayName": "extract_runs",
+      "queryLines": [
+        "SELECT finished_at, entity, status, records, pages, round(bytes / 1048576, 2) AS mb,\n",
+        "distinct_keys, expected, window_from, window_to\n",
+        "FROM ops.ingest_runs WHERE finished_at >= timestampadd(DAY, -7, current_timestamp())\n"
+      ]
+    },
+    {
+      "name": "dq_latest",
+      "displayName": "dq_latest",
+      "queryLines": [
+        "SELECT check_name, severity, failed_rows, sample, checked_at, run_id\n",
+        "FROM ops.dq_results\n",
+        "WHERE run_id = (SELECT max_by(run_id, checked_at) FROM ops.dq_results WHERE run_id IS NOT NULL)\n",
+        "ORDER BY severity, failed_rows DESC\n"
+      ]
+    },
+    {
+      "name": "bc_sync_daily",
+      "displayName": "bc_sync_daily",
+      "queryLines": [
+        "SELECT date_trunc('DAY', synced_at) AS day, result, count(*) AS documents\n",
+        "FROM ops.bc_sync GROUP BY ALL\n"
+      ]
+    },
+    {
+      "name": "bc_held",
+      "displayName": "bc_held",
+      "queryLines": [
+        "SELECT 'sales invoice' AS document, hold_reason, count(*) AS documents\n",
+        "FROM business_central.sales_invoices WHERE hold_reason IS NOT NULL GROUP BY ALL\n",
+        "UNION ALL\n",
+        "SELECT 'purchase invoice', hold_reason, count(*)\n",
+        "FROM business_central.purchase_invoices WHERE hold_reason IS NOT NULL GROUP BY ALL\n"
+      ]
+    },
+    {
+      "name": "publish_log",
+      "displayName": "publish_log",
+      "queryLines": [
+        "SELECT published_at, run_id, versions FROM ops.publish\n",
+        "WHERE published_at >= timestampadd(DAY, -7, current_timestamp())\n"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "bookings_revenue",
+      "displayName": "Bookings and revenue",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "t_bookings",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Bookings and revenue\n",
+                "Source: gold.fact_booking, gold.dim_date, gold.dim_agency, gold.obt_booking_service. Active = status BOOKED or RQ. All bookings are priced in USD.\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "c_active",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "booking_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(active_bookings)",
+                      "expression": "SUM(`active_bookings`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(active_bookings)",
+                  "displayName": "Active bookings"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Active bookings"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "c_revenue",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "booking_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(revenue_usd)",
+                      "expression": "SUM(`revenue_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(revenue_usd)",
+                  "displayName": "Revenue of active bookings (USD)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Revenue of active bookings (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "c_margin",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "booking_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(gross_margin_usd)",
+                      "expression": "SUM(`gross_margin_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(gross_margin_usd)",
+                  "displayName": "Gross margin (USD)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Gross margin (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "b_created",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "bookings_by_created_month",
+                  "fields": [
+                    {
+                      "name": "created_month",
+                      "expression": "`created_month`"
+                    },
+                    {
+                      "name": "sum(bookings)",
+                      "expression": "SUM(`bookings`)"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "created_month",
+                  "displayName": "created_month",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(bookings)",
+                  "displayName": "bookings",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "status",
+                  "displayName": "status",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Bookings by creation month"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 6,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "l_travel",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "revenue_by_travel_month",
+                  "fields": [
+                    {
+                      "name": "travel_month",
+                      "expression": "`travel_month`"
+                    },
+                    {
+                      "name": "sum(revenue_usd)",
+                      "expression": "SUM(`revenue_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "travel_month",
+                  "displayName": "travel_month",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(revenue_usd)",
+                  "displayName": "revenue_usd",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Revenue of active bookings by travel start month (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 12,
+            "width": 6,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "b_agencies",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "top_agencies",
+                  "fields": [
+                    {
+                      "name": "agency_name",
+                      "expression": "`agency_name`"
+                    },
+                    {
+                      "name": "sum(revenue_usd)",
+                      "expression": "SUM(`revenue_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "y": {
+                  "fieldName": "agency_name",
+                  "displayName": "agency_name",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "x-reversed"
+                    }
+                  }
+                },
+                "x": {
+                  "fieldName": "sum(revenue_usd)",
+                  "displayName": "revenue_usd",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Top 15 agencies by revenue (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 19,
+            "width": 3,
+            "height": 9
+          }
+        },
+        {
+          "widget": {
+            "name": "p_trip",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "bookings_by_trip_type",
+                  "fields": [
+                    {
+                      "name": "trip_type",
+                      "expression": "`trip_type`"
+                    },
+                    {
+                      "name": "sum(bookings)",
+                      "expression": "SUM(`bookings`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "pie",
+              "encodings": {
+                "angle": {
+                  "fieldName": "sum(bookings)",
+                  "displayName": "bookings",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "trip_type",
+                  "displayName": "trip_type",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Active bookings by trip type"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 19,
+            "width": 3,
+            "height": 9
+          }
+        },
+        {
+          "widget": {
+            "name": "t_dest",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "top_destinations",
+                  "fields": [
+                    {
+                      "name": "destination_country",
+                      "expression": "`destination_country`"
+                    },
+                    {
+                      "name": "bookings",
+                      "expression": "`bookings`"
+                    },
+                    {
+                      "name": "services",
+                      "expression": "`services`"
+                    },
+                    {
+                      "name": "sale_usd",
+                      "expression": "`sale_usd`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "itemsPerPage": 25,
+              "condensed": true,
+              "withRowNumber": false,
+              "invisibleColumns": [],
+              "allowHTMLByDefault": false,
+              "paginationSize": "default",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "destination_country",
+                    "displayName": "destination_country",
+                    "title": "destination_country",
+                    "order": 10000,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "bookings",
+                    "displayName": "bookings",
+                    "title": "bookings",
+                    "order": 10001,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "services",
+                    "displayName": "services",
+                    "title": "services",
+                    "order": 10002,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "sale_usd",
+                    "displayName": "sale_usd",
+                    "title": "sale_usd",
+                    "order": 10003,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Top destination countries"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 28,
+            "width": 6,
+            "height": 8
+          }
+        }
+      ]
+    },
+    {
+      "name": "suppliers_cost",
+      "displayName": "Suppliers and cost",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "t_suppliers",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Suppliers and cost\n",
+                "Source: gold.obt_booking_service. Cost is shown in the booking currency (USD), converted by Travel Compositor. Active services of active bookings only.\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "c_suppliers",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "supplier_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(suppliers_used)",
+                      "expression": "SUM(`suppliers_used`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(suppliers_used)",
+                  "displayName": "Suppliers used"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Suppliers used"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "c_cost",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "supplier_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(cost_usd)",
+                      "expression": "SUM(`cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(cost_usd)",
+                  "displayName": "Service cost (USD)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Service cost (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "c_margin_pct",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "supplier_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(service_margin_pct)",
+                      "expression": "SUM(`service_margin_pct`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(service_margin_pct)",
+                  "displayName": "Service margin (share of sale)"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Service margin (share of sale)"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "b_category",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "cost_by_category",
+                  "fields": [
+                    {
+                      "name": "service_category",
+                      "expression": "`service_category`"
+                    },
+                    {
+                      "name": "sum(cost_usd)",
+                      "expression": "SUM(`cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "service_category",
+                  "displayName": "service_category",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(cost_usd)",
+                  "displayName": "cost_usd",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Cost by service category (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 3,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "p_source",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "supplier_source_mix",
+                  "fields": [
+                    {
+                      "name": "supplier_source",
+                      "expression": "`supplier_source`"
+                    },
+                    {
+                      "name": "sum(services)",
+                      "expression": "SUM(`services`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "pie",
+              "encodings": {
+                "angle": {
+                  "fieldName": "sum(services)",
+                  "displayName": "services",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "supplier_source",
+                  "displayName": "supplier_source",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Services by supplier source"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 5,
+            "width": 3,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "b_suppliers",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "top_suppliers",
+                  "fields": [
+                    {
+                      "name": "supplier_name",
+                      "expression": "`supplier_name`"
+                    },
+                    {
+                      "name": "sum(cost_usd)",
+                      "expression": "SUM(`cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "y": {
+                  "fieldName": "supplier_name",
+                  "displayName": "supplier_name",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "x-reversed"
+                    }
+                  }
+                },
+                "x": {
+                  "fieldName": "sum(cost_usd)",
+                  "displayName": "cost_usd",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Top 20 suppliers by cost (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 13,
+            "width": 3,
+            "height": 10
+          }
+        },
+        {
+          "widget": {
+            "name": "b_country",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "cost_by_destination_country",
+                  "fields": [
+                    {
+                      "name": "destination_country",
+                      "expression": "`destination_country`"
+                    },
+                    {
+                      "name": "sum(cost_usd)",
+                      "expression": "SUM(`cost_usd`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "y": {
+                  "fieldName": "destination_country",
+                  "displayName": "destination_country",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "x-reversed"
+                    }
+                  }
+                },
+                "x": {
+                  "fieldName": "sum(cost_usd)",
+                  "displayName": "cost_usd",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Cost by destination country (USD)"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 13,
+            "width": 3,
+            "height": 10
+          }
+        },
+        {
+          "widget": {
+            "name": "t_suppliers_detail",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "top_suppliers",
+                  "fields": [
+                    {
+                      "name": "supplier_name",
+                      "expression": "`supplier_name`"
+                    },
+                    {
+                      "name": "supplier_source",
+                      "expression": "`supplier_source`"
+                    },
+                    {
+                      "name": "services",
+                      "expression": "`services`"
+                    },
+                    {
+                      "name": "cost_usd",
+                      "expression": "`cost_usd`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "itemsPerPage": 25,
+              "condensed": true,
+              "withRowNumber": false,
+              "invisibleColumns": [],
+              "allowHTMLByDefault": false,
+              "paginationSize": "default",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "supplier_name",
+                    "displayName": "supplier_name",
+                    "title": "supplier_name",
+                    "order": 10000,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "supplier_source",
+                    "displayName": "supplier_source",
+                    "title": "supplier_source",
+                    "order": 10001,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "services",
+                    "displayName": "services",
+                    "title": "services",
+                    "order": 10002,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "cost_usd",
+                    "displayName": "cost_usd",
+                    "title": "cost_usd",
+                    "order": 10003,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Top suppliers"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 23,
+            "width": 6,
+            "height": 8
+          }
+        }
+      ]
+    },
+    {
+      "name": "pipeline_ops",
+      "displayName": "Pipeline operations",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "t_ops",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Pipeline operations\n",
+                "Source: ops.ingest_runs, ops.dq_results, ops.publish, ops.bc_sync, business_central.*. Job vio_tc_to_bc runs every hour at minute 05; local/push_to_bc.py runs at minute 35.\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "b_extract",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "extract_runs",
+                  "fields": [
+                    {
+                      "name": "finished_at",
+                      "expression": "`finished_at`"
+                    },
+                    {
+                      "name": "sum(records)",
+                      "expression": "SUM(`records`)"
+                    },
+                    {
+                      "name": "entity",
+                      "expression": "`entity`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "finished_at",
+                  "displayName": "finished_at",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(records)",
+                  "displayName": "records",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "entity",
+                  "displayName": "entity",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Records extracted per run (last 7 days)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 6,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "t_dq",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "dq_latest",
+                  "fields": [
+                    {
+                      "name": "check_name",
+                      "expression": "`check_name`"
+                    },
+                    {
+                      "name": "severity",
+                      "expression": "`severity`"
+                    },
+                    {
+                      "name": "failed_rows",
+                      "expression": "`failed_rows`"
+                    },
+                    {
+                      "name": "sample",
+                      "expression": "`sample`"
+                    },
+                    {
+                      "name": "checked_at",
+                      "expression": "`checked_at`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "itemsPerPage": 25,
+              "condensed": true,
+              "withRowNumber": false,
+              "invisibleColumns": [],
+              "allowHTMLByDefault": false,
+              "paginationSize": "default",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "check_name",
+                    "displayName": "check_name",
+                    "title": "check_name",
+                    "order": 10000,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "severity",
+                    "displayName": "severity",
+                    "title": "severity",
+                    "order": 10001,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "failed_rows",
+                    "displayName": "failed_rows",
+                    "title": "failed_rows",
+                    "order": 10002,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "sample",
+                    "displayName": "sample",
+                    "title": "sample",
+                    "order": 10003,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "checked_at",
+                    "displayName": "checked_at",
+                    "title": "checked_at",
+                    "order": 10004,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Data-quality checks of the latest job run"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 9,
+            "width": 6,
+            "height": 10
+          }
+        },
+        {
+          "widget": {
+            "name": "b_sync",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "bc_sync_daily",
+                  "fields": [
+                    {
+                      "name": "day",
+                      "expression": "`day`"
+                    },
+                    {
+                      "name": "sum(documents)",
+                      "expression": "SUM(`documents`)"
+                    },
+                    {
+                      "name": "result",
+                      "expression": "`result`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "day",
+                  "displayName": "day",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(documents)",
+                  "displayName": "documents",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "result",
+                  "displayName": "result",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Documents pushed into Business Central per day"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 19,
+            "width": 3,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "b_held",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "bc_held",
+                  "fields": [
+                    {
+                      "name": "hold_reason",
+                      "expression": "`hold_reason`"
+                    },
+                    {
+                      "name": "sum(documents)",
+                      "expression": "SUM(`documents`)"
+                    },
+                    {
+                      "name": "document",
+                      "expression": "`document`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "hold_reason",
+                  "displayName": "hold_reason",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(documents)",
+                  "displayName": "documents",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "document",
+                  "displayName": "document",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Documents held, by reason"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 19,
+            "width": 3,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "t_runs",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "extract_runs",
+                  "fields": [
+                    {
+                      "name": "finished_at",
+                      "expression": "`finished_at`"
+                    },
+                    {
+                      "name": "entity",
+                      "expression": "`entity`"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "records",
+                      "expression": "`records`"
+                    },
+                    {
+                      "name": "distinct_keys",
+                      "expression": "`distinct_keys`"
+                    },
+                    {
+                      "name": "expected",
+                      "expression": "`expected`"
+                    },
+                    {
+                      "name": "pages",
+                      "expression": "`pages`"
+                    },
+                    {
+                      "name": "mb",
+                      "expression": "`mb`"
+                    },
+                    {
+                      "name": "window_from",
+                      "expression": "`window_from`"
+                    },
+                    {
+                      "name": "window_to",
+                      "expression": "`window_to`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "itemsPerPage": 25,
+              "condensed": true,
+              "withRowNumber": false,
+              "invisibleColumns": [],
+              "allowHTMLByDefault": false,
+              "paginationSize": "default",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "finished_at",
+                    "displayName": "finished_at",
+                    "title": "finished_at",
+                    "order": 10000,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "entity",
+                    "displayName": "entity",
+                    "title": "entity",
+                    "order": 10001,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "status",
+                    "displayName": "status",
+                    "title": "status",
+                    "order": 10002,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "records",
+                    "displayName": "records",
+                    "title": "records",
+                    "order": 10003,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "distinct_keys",
+                    "displayName": "distinct_keys",
+                    "title": "distinct_keys",
+                    "order": 10004,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "expected",
+                    "displayName": "expected",
+                    "title": "expected",
+                    "order": 10005,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "pages",
+                    "displayName": "pages",
+                    "title": "pages",
+                    "order": 10006,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "mb",
+                    "displayName": "mb",
+                    "title": "mb",
+                    "order": 10007,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "window_from",
+                    "displayName": "window_from",
+                    "title": "window_from",
+                    "order": 10008,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "window_to",
+                    "displayName": "window_to",
+                    "title": "window_to",
+                    "order": 10009,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Extract runs (last 7 days)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 27,
+            "width": 6,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "t_publish",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "publish_log",
+                  "fields": [
+                    {
+                      "name": "published_at",
+                      "expression": "`published_at`"
+                    },
+                    {
+                      "name": "run_id",
+                      "expression": "`run_id`"
+                    },
+                    {
+                      "name": "versions",
+                      "expression": "`versions`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "itemsPerPage": 25,
+              "condensed": true,
+              "withRowNumber": false,
+              "invisibleColumns": [],
+              "allowHTMLByDefault": false,
+              "paginationSize": "default",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "published_at",
+                    "displayName": "published_at",
+                    "title": "published_at",
+                    "order": 10000,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "run_id",
+                    "displayName": "run_id",
+                    "title": "run_id",
+                    "order": 10001,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  },
+                  {
+                    "fieldName": "versions",
+                    "displayName": "versions",
+                    "title": "versions",
+                    "order": 10002,
+                    "visible": true,
+                    "type": "string",
+                    "displayAs": "string",
+                    "alignContent": "left",
+                    "allowHTML": false,
+                    "allowSearch": false,
+                    "booleanValues": [
+                      "false",
+                      "true"
+                    ],
+                    "dateTimeFormat": "YYYY-MM-DD HH:mm",
+                    "highlightLinks": false,
+                    "imageHeight": "",
+                    "imageTitleTemplate": "{{ @ }}",
+                    "imageUrlTemplate": "{{ @ }}",
+                    "imageWidth": "",
+                    "linkOpenInNewTab": true,
+                    "linkTextTemplate": "{{ @ }}",
+                    "linkTitleTemplate": "{{ @ }}",
+                    "linkUrlTemplate": "{{ @ }}",
+                    "preserveWhitespace": false,
+                    "useMonospaceFont": false
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Business Central tables published (last 7 days)"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 35,
+            "width": 6,
+            "height": 6
+          }
+        }
+      ]
+    }
+  ]
+}

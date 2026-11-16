@@ -1,0 +1,31 @@
+# Vio Travel data platform: Travel Compositor API -> Unity Catalog catalog vio_travel -> star schema,
+# Business Central integration tables and an AI/BI dashboard.
+# The catalog itself is created once with sql/setup-catalog.sql (Default Storage catalogs are created through SQL).
+bundle:
+  name: vio_data_platform
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog that holds every layer of this platform
+    default: vio_travel
+  warehouse_id:
+    description: SQL warehouse used by the dashboard and by local/push_to_bc.py
+    default: 59d2b145a89ef5c1
+
+targets:
+  dev:
+    mode: development          # prefixes resource names, pauses schedules
+    variables:
+      catalog: vio_travel_dev
+    workspace:
+      host: https://dbc-b0a66a17-fa1b.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/vio-data-platform/dev
+  prod:
+    mode: production
+    default: true
+    workspace:
+      host: https://dbc-b0a66a17-fa1b.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/vio-data-platform/prod

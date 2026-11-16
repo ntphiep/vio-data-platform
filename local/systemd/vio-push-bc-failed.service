@@ -1,0 +1,6 @@
+[Unit]
+Description=Desktop notification when vio-push-bc.service fails
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/notify-send -u critical -a vio-push-bc "Vio push into Business Central failed" "journalctl --user -u vio-push-bc.service -n 50"

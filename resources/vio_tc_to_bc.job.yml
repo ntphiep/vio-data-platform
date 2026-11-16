@@ -1,0 +1,71 @@
+resources:
+  jobs:
+    vio_tc_to_bc:
+      name: vio_tc_to_bc
+      description: >-
+        Travel Compositor API -> volume raw.landing -> bronze -> silver, then two outputs built in parallel from
+        silver: the star schema in gold (read by the dashboard vio_travel_overview) and the Business Central
+        integration tables in business_central (published only after the blocking data-quality checks pass,
+        then pushed by local/push_to_bc.py outside Databricks because it uses a delegated Azure CLI login).
+      max_concurrent_runs: 1
+      timeout_seconds: 7200
+      queue: {enabled: true}
+      schedule:
+        quartz_cron_expression: "0 5 * * * ?"   # every hour at minute 05
+        timezone_id: Asia/Ho_Chi_Minh
+        pause_status: UNPAUSED
+      health:
+        rules:
+          - metric: RUN_DURATION_SECONDS
+            op: GREATER_THAN
+            value: 1800
+      email_notifications:
+        on_failure: [ "${workspace.current_user.userName}" ]
+        on_duration_warning_threshold_exceeded: [ "${workspace.current_user.userName}" ]
+      tags:
+        project: vio_travel
+        contains_pii: "true"
+      parameters:
+        - name: backfill_from
+          default: ""
+        - name: full_refresh
+          default: "false"
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - requests
+      tasks:
+        - task_key: extract_tc
+          environment_key: default
+          max_retries: 2
+          min_retry_interval_millis: 300000
+          spark_python_task:
+            python_file: ../src/ingest_tc.py
+            parameters: ["--catalog", "${var.catalog}", "--backfill_from", "{{job.parameters.backfill_from}}"]
+        - task_key: bronze_silver
+          depends_on:
+            - task_key: extract_tc
+          environment_key: default
+          max_retries: 1
+          spark_python_task:
+            python_file: ../src/bronze_silver.py
+            parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}",
+                         "--full_refresh", "{{job.parameters.full_refresh}}"]
+        - task_key: star_schema
+          depends_on:
+            - task_key: bronze_silver
+          environment_key: default
+          max_retries: 1
+          spark_python_task:
+            python_file: ../src/star_schema.py
+            parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}"]
+        - task_key: bc_tables
+          depends_on:
+            - task_key: bronze_silver
+          environment_key: default
+          max_retries: 1
+          spark_python_task:
+            python_file: ../src/bc_tables.py
+            parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}"]

@@ -1,0 +1,8 @@
+resources:
+  dashboards:
+    vio_travel_overview:
+      display_name: Vio Travel overview
+      file_path: ../dashboards/vio_travel_overview.lvdash.json
+      warehouse_id: ${var.warehouse_id}
+      dataset_catalog: ${var.catalog}
+      embed_credentials: false

@@ -1,0 +1,22 @@
+{
+  "catalog": "vio_travel",
+  "warehouse_id": "59d2b145a89ef5c1",
+  "bc_tenant": "c3a20a4c-edb7-4fa3-992a-4b60a0d7a4d7",
+  "bc_environment": "Production",
+  "bc_company": "My Company",
+  "bc_company_id": "f1b8af2c-34d7-f111-9260-7ced8dad0c6f",
+  "bc_local_currency": "AUD",
+  "max_bookings_per_run": 5,
+  "scope_sql": "i.invoice_date >= date_sub(current_date(), 30)",
+  "sales_gl_account": "4350",
+  "purchase_gl_account": "5101",
+  "customer_setup": {
+    "customerPostingGroup": "DOMESTIC",
+    "genBusPostingGroup": "DOMESTIC"
+  },
+  "vendor_setup": {
+    "vendorPostingGroup": "DOMESTIC",
+    "genBusPostingGroup": "DOMESTIC"
+  },
+  "fx_source": "https://api.frankfurter.dev/v1"
+}

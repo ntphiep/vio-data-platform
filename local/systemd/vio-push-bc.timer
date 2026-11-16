@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly push into Business Central, 30 minutes after the Databricks job vio_tc_to_bc (minute 05)
+
+[Timer]
+OnCalendar=*-*-* *:35:00
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

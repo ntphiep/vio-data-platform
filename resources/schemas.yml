@@ -1,0 +1,50 @@
+resources:
+  schemas:
+    raw:
+      catalog_name: ${var.catalog}
+      name: raw
+      comment: Landing volume with Travel Compositor API responses as gzip NDJSON. Contains personal data.
+      lifecycle: {prevent_destroy: true}
+    bronze:
+      catalog_name: ${var.catalog}
+      name: bronze
+      comment: Append-only copy of every landed record as VARIANT (Auto Loader). Contains personal data.
+      lifecycle: {prevent_destroy: true}
+    silver:
+      catalog_name: ${var.catalog}
+      name: silver
+      comment: Current state of bookings, booking services, agencies and suppliers. Contains personal data.
+      lifecycle: {prevent_destroy: true}
+    gold:
+      catalog_name: ${var.catalog}
+      name: gold
+      comment: Analytics model - star schema (dim_*, fact_*) and one big table obt_booking_service. Rebuilt each run.
+    business_central:
+      catalog_name: ${var.catalog}
+      name: business_central
+      comment: Integration output shaped for the Business Central API; read by local/push_to_bc.py. Rebuilt each run.
+    ref:
+      catalog_name: ${var.catalog}
+      name: ref
+      comment: Mapping tables maintained by Vio Finance (umbrella agency, customer map, vendor map).
+      lifecycle: {prevent_destroy: true}
+    ops:
+      catalog_name: ${var.catalog}
+      name: ops
+      comment: Run logs, watermark, data-quality results, publish versions, Business Central sync log.
+      lifecycle: {prevent_destroy: true}
+
+  volumes:
+    landing:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.raw.name}
+      name: landing
+      volume_type: MANAGED
+      comment: One folder per entity, ingest_date and run; files older than 90 days are removed by extract_tc.
+      lifecycle: {prevent_destroy: true}
+    checkpoints:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.ops.name}
+      name: checkpoints
+      volume_type: MANAGED
+      comment: Auto Loader checkpoints of the bronze streams.

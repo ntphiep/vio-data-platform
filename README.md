@@ -73,7 +73,7 @@ the dashboard and Business Central name a supplier the same way.
 | `src/` | job tasks |
 | `dashboards/build_dashboard.py` | generates `dashboards/vio_travel_overview.lvdash.json`; edit the script, not the JSON |
 | `local/` | `push_to_bc.py`, `config.json`, systemd units for the hourly push |
-| `sql/` | one-time SQL: `setup-catalog.sql`, `migrate-from-workspace-vio-tc.sql`, `ref-maps-lab-seed.sql` |
+| `sql/` | one-time SQL: `setup-catalog.sql`, `ref-maps-lab-seed.sql` |
 | `tests/` | unit tests for the API client and the Business Central client |
 
 ## Run

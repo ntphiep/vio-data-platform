@@ -79,6 +79,7 @@ MAX_FAILURES = 3
 # Posted statuses of salesInvoices / purchaseInvoices. "Draft" is editable; " " and "In Review" are neither
 # editable here nor posted. https://learn.microsoft.com/en-us/dynamics365/business-central/dev-itpro/api-reference/v2.0/resources/dynamics_salesinvoice
 POSTED_STATUSES = ("Open", "Paid", "Canceled", "Corrective")
+TOTAL = "totalAmountIncludingTax"  # field of salesInvoices and purchaseInvoices
 # Max operations in one OData $batch request (Business Central online).
 # https://learn.microsoft.com/en-us/dynamics365/business-central/dev-itpro/administration/operational-limits-online
 MAX_BATCH = 100
@@ -294,7 +295,12 @@ class BC:
             f"{self.api}/{entity}", params={"$filter": f"{field} eq '{odata_str(value)}'"}, what=f"GET {entity}"
         )
         if len(v) > 1:
-            raise RuntimeError(f"DUPLICATE_IN_BC: {len(v)} {entity} with {field} = {value}")
+            # Deleting a numbered draft makes Business Central post an empty invoice under the same external
+            # number (seen on 15/11 with the first lab version). Such a posted zero document is not a duplicate.
+            live = [x for x in v if not (x.get("status") in POSTED_STATUSES and not float(x.get(TOTAL, 0) or 0))]
+            if len(live) != 1:
+                raise RuntimeError(f"DUPLICATE_IN_BC: {len(v)} {entity} with {field} = {value}")
+            return live[0]
         return v[0] if v else None
 
     def upsert_party(self, entity, page, body, setup):
@@ -331,7 +337,7 @@ class BC:
             self.currencies = {x["code"] for x in self.get_all(f"{self.api}/currencies", what="GET currencies")}
         return code == self.cfg["bc_local_currency"] or code in self.currencies
 
-    def ensure_exchange_rates(self, needs, errors=None):
+    def ensure_exchange_rates(self, needs, errors=None, fallback=None):
         """needs = {(currency, date)}. API v2.0 cannot insert exchange rates (entity set currencyExchangeRates
         is read-only), so missing rates are loaded as a RapidStart configuration package (table 330 Currency
         Exchange Rate) through the automation API: create package, upload file, import, apply, delete.
@@ -343,8 +349,11 @@ class BC:
         Each currency is loaded on its own. When errors is a dict, a currency that fails is recorded there
         (currency -> message) and the others still load; when errors is None, the first failure is raised.
 
-        Returns (loaded, unavailable): the rates loaded as (currency, date, foreign per 1 LCY), and the
-        (currency, date) pairs the rate source does not publish (ECB has no VND or FJD, for example)."""
+        fallback(pairs) -> {(currency, date): foreign per 1 LCY} supplies the pairs the ECB does not publish (VND
+        and FJD, for example); see tc_implied_rates.
+
+        Returns (loaded, unavailable): the rates loaded as (currency, date, foreign per 1 LCY, source), and the
+        (currency, date) pairs no source has."""
         lcy = self.cfg["bc_local_currency"]
         days = {}
         for cur, day in needs:
@@ -361,21 +370,27 @@ class BC:
                         what="GET rates",
                     )
                 }
-                rows = []
+                rows, missing = [], []
                 for day in sorted(days[cur] - have):
                     r = requests.get(f"{self.cfg['fx_source']}/{day}", params={"base": lcy, "symbols": cur}, timeout=30)
                     if r.status_code == 404 or (r.ok and cur not in r.json().get("rates", {})):
-                        unavailable.add((cur, day))
+                        missing.append(day)
                         continue
                     r.raise_for_status()
-                    rows.append((cur, day, decimal_text(r.json()["rates"][cur])))  # 1 LCY = x foreign
+                    rows.append((cur, day, decimal_text(r.json()["rates"][cur]), "ECB"))  # 1 LCY = x foreign
+                derived = fallback([(cur, d) for d in missing]) if fallback and missing else {}
+                for day in missing:
+                    if (cur, day) in derived:
+                        rows.append((cur, day, derived[(cur, day)], "Travel Compositor"))
+                    else:
+                        unavailable.add((cur, day))
                 if rows:
                     recs = "".join(
                         f"<CurrencyExchangeRate><CurrencyCode>{c}</CurrencyCode><StartingDate>{d}</StartingDate>"
                         f"<ExchangeRateAmount>{x}</ExchangeRateAmount><AdjustmentExchRateAmount>{x}"
                         f"</AdjustmentExchRateAmount><RelationalExchRateAmount>1</RelationalExchRateAmount>"
                         f"<RelationalAdjmtExchRateAmt>1</RelationalAdjmtExchRateAmt></CurrencyExchangeRate>"
-                        for c, d, x in rows
+                        for c, d, x, _ in rows
                     )
                     self.apply_package("FX" + cur, 330, "CurrencyExchangeRateList", recs)
                     loaded += rows
@@ -430,6 +445,40 @@ class BC:
                     )
         finally:
             self.call("DELETE", f"{auto}/configurationPackages({pid})", headers={"If-Match": "*"})
+
+
+def tc_implied_rates(db, cfg, pairs, window_days=30, min_services=3):
+    """Rates for currencies the ECB does not publish, as foreign per 1 LCY on each (currency, date) of pairs.
+
+    Travel Compositor prices every service in its supplier currency (cost_amount, cost_currency) and also in the
+    booking currency (cost_in_sale_currency, sale_currency USD), so cost_amount / cost_in_sale_currency is the
+    rate Vio's own booking platform used. Silver keeps the current version of each booking only, so the rate is the
+    median over the services in that currency whose last update is nearest to the date (within window_days of the
+    nearest one; at least min_services; services under 10 USD skipped because of 2-decimal rounding), then
+    multiplied by the ECB USD rate of that date to reach the LCY base Business Central expects."""
+    lcy, out = cfg["bc_local_currency"], {}
+    if not pairs:
+        return out
+    values = ",".join(f"('{odata_str(c)}', DATE'{d}')" for c, d in pairs)
+    rows = db.q(f"""
+        WITH need(cur, day) AS (VALUES {values}),
+        cand AS (
+            SELECT n.cur, n.day, s.cost_amount / s.cost_in_sale_currency AS rate,
+                   abs(datediff(to_date(s.last_update_at), n.day)) AS dist
+            FROM need n JOIN {cfg["catalog"]}.silver.booking_services s
+              ON s.cost_currency = n.cur AND s.sale_currency = 'USD' AND s.cost_amount > 0
+             AND s.cost_in_sale_currency >= 10),
+        nearest AS (SELECT cur, day, min(dist) AS d0 FROM cand GROUP BY ALL)
+        SELECT c.cur, CAST(c.day AS STRING) AS day, percentile(c.rate, 0.5) AS per_usd, count(*) AS services
+        FROM cand c JOIN nearest x ON x.cur = c.cur AND x.day = c.day
+        WHERE c.dist <= x.d0 + {int(window_days)}
+        GROUP BY ALL HAVING count(*) >= {int(min_services)}""")
+    for r in rows:
+        u = requests.get(f"{cfg['fx_source']}/{r['day']}", params={"base": lcy, "symbols": "USD"}, timeout=30)
+        u.raise_for_status()
+        usd_per_lcy = Decimal(str(u.json()["rates"]["USD"]))
+        out[(r["cur"], r["day"])] = format((Decimal(r["per_usd"]) * usd_per_lcy).quantize(Decimal("0.000001")), "f")
+    return out
 
 
 def replace_lines(bc, entity, lines_key, doc_id, header, lines):
@@ -517,12 +566,16 @@ def process_removals(bc, rows, max_removals, record):
 
 
 # ------------------------------------------------------------------ what to send
-def doc_decision(row, hold_reason):
-    """HELD, HELD_LOGGED, DONE, DEAD or SEND for one document row joined with its sync state (state_sql)."""
+def doc_decision(row, hold_reason, retry=frozenset()):
+    """HELD, HELD_LOGGED, DONE, DEAD or SEND for one document row joined with its sync state (state_sql).
+    retry: results (from --retry) whose documents are sent again although their hash did not change, for example
+    NO_EXCHANGE_RATE after a new rate source, or dead-lettered FAILED after the cause was fixed."""
     h = row["payload_hash"]
     if hold_reason and row["doc_action"] == "UPSERT":
         logged = row.get("log_result") == "HELD" and row.get("log_hash") == h and row.get("log_error") == hold_reason
         return "HELD_LOGGED" if logged else "HELD"
+    if row.get("attempt_result") in retry:
+        return "SEND"
     if row.get("attempt_result") in TERMINAL and row.get("attempt_hash") == h:
         return "DONE"
     if int(row.get("failures") or 0) >= MAX_FAILURES:
@@ -532,7 +585,7 @@ def doc_decision(row, hold_reason):
     return "SEND"
 
 
-def plan(sales, purchases, limit):
+def plan(sales, purchases, limit, retry=frozenset()):
     """Decide per document. Returns (todo, held, pending):
     todo    up to limit sales rows, oldest change first, of bookings with a sales or purchase document to send;
             each carries _send (bool) and _purchases (purchase rows to send)
@@ -540,7 +593,7 @@ def plan(sales, purchases, limit):
     pending number of bookings with something to send (more than len(todo) means a backlog)"""
     held, by_ref = [], {}
     for s in sales:
-        s["_decision"] = doc_decision(s, s.get("hold_reason"))
+        s["_decision"] = doc_decision(s, s.get("hold_reason"), retry)
         s["_send"] = s["_decision"] == "SEND"
         s["_purchases"] = []
         by_ref[s["external_document_number"]] = s
@@ -550,7 +603,7 @@ def plan(sales, purchases, limit):
         reason = p.get("hold_reason") or (
             f"SALES_HELD {p['sales_hold_reason']}" if p.get("sales_hold_reason") else None
         )
-        d = doc_decision(p, reason)
+        d = doc_decision(p, reason, retry)
         if d == "HELD":
             held.append(("purchase", p["purchase_key"], p["payload_hash"], reason))
         elif d == "SEND" and p["booking_ref"] in by_ref:
@@ -619,6 +672,11 @@ def main():
     ap.add_argument("--limit", type=int)
     ap.add_argument("--scope_sql", help="override the SQL filter on sales invoices, e.g. for a backfill push")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--retry",
+        default="",
+        help="comma-separated results to send again although the payload did not change, e.g. NO_EXCHANGE_RATE,FAILED",
+    )
     ap.add_argument("--on-new-run", action="store_true", help="exit unless the job finished a run since the last push")
     a = ap.parse_args()
     cfg = load_cfg()
@@ -648,7 +706,8 @@ def main():
     company = lit(cfg["bc_company"])
     scope = a.scope_sql or cfg.get("scope_sql", "TRUE")
     q = doc_queries(c, company, g, scope)
-    todo, held, pending = plan(db.q(q["sales"]), db.q(q["purchases"]), limit)
+    retry = frozenset(x.strip() for x in a.retry.split(",") if x.strip())
+    todo, held, pending = plan(db.q(q["sales"]), db.q(q["purchases"]), limit, retry)
     removed = db.q(q["removed"])
     if not todo and not held and not removed:
         print("nothing to push")
@@ -711,11 +770,15 @@ def main():
         needs = {(h["currency_code"], h["invoice_date"]) for h in todo if h["_send"] and h["doc_action"] == "UPSERT"}
         needs |= {(p["currency_code"], p["invoice_date"]) for p in p_heads if p["doc_action"] == "UPSERT"}
         fx_errors = {}
-        loaded, no_rate = bc.ensure_exchange_rates(needs, errors=fx_errors)
-        for cur, day, x in loaded:
-            record("fx_rate", f"{cur}/{day}", None, None, "LOADED", f"{x} {cur} = 1 {lcy}")
+        loaded, no_rate = bc.ensure_exchange_rates(
+            needs, errors=fx_errors, fallback=lambda pairs: tc_implied_rates(db, cfg, pairs)
+        )
+        for cur, day, x, source in loaded:
+            record("fx_rate", f"{cur}/{day}", None, None, "LOADED", f"{x} {cur} = 1 {lcy} ({source})")
         for cur, day in sorted(no_rate):
-            record("fx_rate", f"{cur}/{day}", None, None, "UNAVAILABLE", f"{cfg['fx_source']} has no rate")
+            record(
+                "fx_rate", f"{cur}/{day}", None, None, "UNAVAILABLE", "no ECB rate and too few services to derive one"
+            )
         for cur, err in sorted(fx_errors.items()):
             record("fx_rate", cur, None, None, "FAILED", err)
 

@@ -117,6 +117,19 @@ def test_find_rejects_duplicates(monkeypatch):
         client.find("salesInvoices", "externalDocumentNumber", "EXA-1")
 
 
+def test_find_ignores_a_posted_empty_invoice_under_the_same_number(monkeypatch):
+    rows = [
+        {"id": "p1", "status": "Paid", "totalAmountIncludingTax": 0},
+        {"id": "d1", "status": "Draft", "totalAmountIncludingTax": 1340.5},
+    ]
+    client, _, _ = bc([Resp(200, {"value": rows})], monkeypatch)
+    assert client.find("salesInvoices", "externalDocumentNumber", "EXA-1")["id"] == "d1"
+    two_live = [{"id": "p1", "status": "Paid", "totalAmountIncludingTax": 10}, rows[1]]
+    client, _, _ = bc([Resp(200, {"value": two_live})], monkeypatch)
+    with pytest.raises(RuntimeError, match="DUPLICATE_IN_BC"):
+        client.find("salesInvoices", "externalDocumentNumber", "EXA-1")
+
+
 def test_posted_document_is_never_changed(monkeypatch):
     client, s, _ = bc([Resp(200, {"value": [{"id": "d1", "status": "Paid"}]})], monkeypatch)
     result, _ = m.push_document(client, "sales", "externalDocumentNumber", "EXA-1", {}, [])
@@ -152,6 +165,43 @@ def test_exchange_rate_missing_at_source_skips_only_that_currency(monkeypatch):
     assert s.calls == ["GET"]
 
 
+def test_exchange_rate_missing_at_source_uses_fallback(monkeypatch):
+    # the ECB has no FJD; the Travel Compositor fallback supplies it and the package carries that value
+    client, _, _ = bc([Resp(200, {"value": []})], monkeypatch)
+    client.cfg["fx_source"] = "https://fx.example"
+    monkeypatch.setattr(m.requests, "get", lambda url, params, timeout: Resp(404))
+    seen = []
+    monkeypatch.setattr(client, "apply_package", lambda *a: seen.append(a))
+    asked = []
+
+    def fallback(pairs):
+        asked.extend(pairs)
+        return {("FJD", "2026-11-09"): "1.468000"}
+
+    loaded, unavailable = client.ensure_exchange_rates({("FJD", "2026-11-09")}, fallback=fallback)
+    assert asked == [("FJD", "2026-11-09")]
+    assert loaded == [("FJD", "2026-11-09", "1.468000", "Travel Compositor")] and unavailable == set()
+    assert "<ExchangeRateAmount>1.468000</ExchangeRateAmount>" in seen[0][3]
+
+
+def test_tc_implied_rate_converts_the_usd_median_to_lcy(monkeypatch):
+    class FakeDB:
+        def __init__(self):
+            self.sql = ""
+
+        def q(self, sql):
+            self.sql = sql
+            return [{"cur": "VND", "day": "2026-10-05", "per_usd": "26000.0", "services": "12"}]
+
+    monkeypatch.setattr(m.requests, "get", lambda url, params, timeout: Resp(200, {"rates": {"USD": 0.65}}))
+    db = FakeDB()
+    cfg = {"bc_local_currency": "AUD", "catalog": "vio_travel", "fx_source": "https://fx.example"}
+    out = m.tc_implied_rates(db, cfg, [("VND", "2026-10-05")])
+    assert out == {("VND", "2026-10-05"): "16900.000000"}
+    assert "('VND', DATE'2026-10-05')" in db.sql and "cost_in_sale_currency >= 10" in db.sql
+    assert m.tc_implied_rates(db, cfg, []) == {}
+
+
 # ------------------------------------------------------------------ planning (findings 1, 4, 7, 13)
 def doc(**kw):
     row = {"payload_hash": "H1", "doc_action": "UPSERT", "hold_reason": None, "failures": "0"}
@@ -181,6 +231,16 @@ def test_transient_results_become_dead_letters_after_max_failures():
     assert "SKIPPED" in m.TRANSIENT and "NOT_EDITABLE" in m.TRANSIENT
     assert m.doc_decision(doc(failures=str(m.MAX_FAILURES - 1)), None) == "SEND"
     assert m.doc_decision(doc(failures=str(m.MAX_FAILURES)), None) == "DEAD"
+
+
+def test_retry_option_resends_a_terminal_or_dead_result():
+    no_rate = doc(attempt_hash="H1", attempt_result="NO_EXCHANGE_RATE")
+    assert m.doc_decision(no_rate, None) == "DONE"
+    assert m.doc_decision(no_rate, None, frozenset({"NO_EXCHANGE_RATE"})) == "SEND"
+    dead = doc(attempt_hash="H1", attempt_result="FAILED", failures=str(m.MAX_FAILURES))
+    assert m.doc_decision(dead, None) == "DEAD"
+    assert m.doc_decision(dead, None, frozenset({"FAILED"})) == "SEND"
+    assert m.doc_decision(no_rate, "VENDOR_UNMAPPED", frozenset({"NO_EXCHANGE_RATE"})) == "HELD"
 
 
 def test_held_row_is_logged_only_when_hash_or_reason_changes():
@@ -331,7 +391,7 @@ def test_one_failing_currency_does_not_block_the_others(monkeypatch):
     monkeypatch.setattr(client, "apply_package", apply_package)
     errors = {}
     loaded, unavailable = client.ensure_exchange_rates({("EUR", "2026-11-09"), ("USD", "2026-11-09")}, errors)
-    assert loaded == [("EUR", "2026-11-09", "0.5")] and unavailable == set()
+    assert loaded == [("EUR", "2026-11-09", "0.5", "ECB")] and unavailable == set()
     assert list(errors) == ["USD"]
 
 
@@ -342,7 +402,7 @@ def test_exchange_rate_goes_in_with_full_precision(monkeypatch):
     seen = []
     monkeypatch.setattr(client, "apply_package", lambda *a: seen.append(a))
     loaded, _ = client.ensure_exchange_rates({("JPY", "2026-11-09")})
-    assert loaded == [("JPY", "2026-11-09", "97.1234567891")]
+    assert loaded == [("JPY", "2026-11-09", "97.1234567891", "ECB")]
     xml = seen[0][3]
     assert "<ExchangeRateAmount>97.1234567891</ExchangeRateAmount>" in xml
     assert "<RelationalExchRateAmount>1</RelationalExchRateAmount>" in xml

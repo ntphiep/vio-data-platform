@@ -4,8 +4,12 @@ Bookings (incremental source)
     silver.bookings            SCD type 1, one row per booking, AUTO CDC from the bronze stream; the newest
                                lastUpdateDate wins, so a late or replayed page never overwrites a newer version
     silver.bookings_history    SCD type 2 of status, amounts, dates and pax: one row per tracked change
-    silver.booking_services, silver.booking_payments, silver.booking_invoices, silver.booking_price_components
+    silver.booking_services, silver.booking_payments
                                materialized views exploded from the current booking payload
+    silver.booking_invoices, silver.booking_price_components
+                               plain views over the payload, created by job vio_travel_governance (no reader in the
+                               pipeline, and a view costs one Unity Catalog table slot where a materialized view
+                               costs two: the Free Edition metastore holds 500)
 
 Snapshot entities (agencies, suppliers, users, travel ideas, pending payments, purchase attempts)
     silver.<entity>_history    SCD type 2 by AUTO CDC FROM SNAPSHOT over the latest complete snapshot
@@ -16,7 +20,7 @@ Snapshot entities (agencies, suppliers, users, travel ideas, pending payments, p
 Accommodations
     silver.accommodations_history  SCD type 2 of the catalog by AUTO CDC on lastUpdate (the weekly snapshot has
                                282,842 rows, so only the changed rows of the stream are applied)
-    silver.accommodations      open versions
+    silver.accommodations      open versions, a plain view created by job vio_travel_governance
     silver.accommodation_details   SCD type 1 of the datasheets of booked hotels
 
 Expectations: names start with silver_. Rows without a key are dropped (expect_or_drop); the rest warn.
@@ -254,32 +258,6 @@ def booking_payments():
         FROM {S}.bookings b, LATERAL variant_explode(b.payload:manualPayments) x""")
 
 
-@dp.materialized_view(
-    name=f"{S}.booking_invoices",
-    comment="Invoices issued by Travel Compositor for a booking (number, target, creation date).",
-)
-def booking_invoices():
-    return spark.sql(f"""
-        SELECT b.booking_ref, x.value:number::string AS invoice_number, x.value:target::string AS target,
-               to_date(x.value:creationDate::string) AS created_date
-        FROM {S}.bookings b, LATERAL variant_explode(b.payload:invoices) x""")
-
-
-@dp.materialized_view(
-    name=f"{S}.booking_price_components",
-    comment="Price breakdown of a booking, one row per component (totalPrice, netProvider, operatorFee ...).",
-    cluster_by=["booking_ref"],
-)
-def booking_price_components():
-    return spark.sql(f"""
-        SELECT b.booking_ref, x.key AS component,
-               x.value:microsite.currency::string AS currency, x.value:microsite.amount::decimal(18,2) AS amount,
-               x.value:operator.currency::string AS operator_currency,
-               x.value:operator.amount::decimal(18,2) AS operator_amount
-        FROM {S}.bookings b, LATERAL variant_explode(b.payload:pricebreakdown) x
-        WHERE x.value:microsite.amount IS NOT NULL""")
-
-
 # ---------------------------------------------------------------- snapshot entities -------------------------------
 # entity: (keys, select list over r = doc:record, comment, schema of the current table with masks or None)
 SNAPSHOTS = {
@@ -432,15 +410,6 @@ dp.create_auto_cdc_flow(
     track_history_except_column_list=["last_update_at"],
     name="accommodations_scd2",
 )
-
-
-@dp.materialized_view(
-    name=f"{S}.accommodations",
-    comment="Accommodation catalog of Travel Compositor, current version (about 283,000 hotels).",
-    cluster_by=["country"],
-)
-def accommodations():
-    return spark.read.table(f"{S}.accommodations_history").where("__END_AT IS NULL").drop("__START_AT", "__END_AT")
 
 
 @dp.temporary_view(name="accommodation_details_changes")

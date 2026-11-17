@@ -65,7 +65,7 @@ yesterday. Webhooks would need a URL registered on Vio's Travel Compositor accou
 |---|---|---|
 | `raw` | landing | volume `landing`: API responses as returned, one folder per entity |
 | `bronze` | raw history | `tc_<entity>`, one VARIANT row per landed record, append-only, never reset by a full refresh |
-| `silver` | current state and history | see Entities; `*_history` tables are SCD type 2 with `__START_AT`, `__END_AT` |
+| `silver` | current state and history | see Entities; `*_history` tables are SCD type 2 with `__START_AT`, `__END_AT`; `booking_invoices`, `booking_price_components` and `accommodations` are plain views created by job `vio_travel_governance` |
 | `gold` | analytics model | star schema, one big table and metric views, below |
 | `business_central` | integration output | `customers`, `vendors`, `sales_invoices`, `sales_lines`, `purchase_invoices`, `purchase_lines` |
 | `ref` | mappings | `umbrella_agency`, `customer_map`, `vendor_map`, maintained by Vio Finance |
@@ -115,6 +115,7 @@ maps a provider to another vendor in `ref.vendor_map`.
 | Consistent reads for the push | write-audit-publish: `bc_tables` records table versions in `ops.publish` only after its blocking checks pass, and `local/push_to_bc.py` reads `VERSION AS OF` those versions |
 | Business Central writes | POST retried only on 429; documents matched by `externalDocumentNumber` and `vendorInvoiceNumber`; 3 failures with the same hash stop retries |
 | Backfill and replay | job `vio_travel_backfill` (for-each over months, 3 at a time, watermark untouched); a failed or PARTIAL month fails its iteration, and "Repair run" re-runs only those months; job parameter `backfill_from`; a pipeline full refresh rebuilds silver and gold from bronze, which keeps every record; bronze and the snapshot history tables refuse a full refresh (`pipelines.reset.allowed` false) because their history exists only there |
+| Free Edition limits | the metastore holds 500 tables and every pipeline table counts twice (its hidden `__materialization_*` table), so datasets without a reader inside the pipeline are plain views; compute stops for the rest of the day once the daily quota is spent |
 | Retry and SLA | task retries with a minimum interval; pipeline e-mails on update and flow failure; job e-mail on failure and on runs over 30 minutes; SQL alert as dead-man switch |
 
 ## Governance

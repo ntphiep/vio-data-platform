@@ -10,6 +10,9 @@ Idempotent; runs after each deploy and weekly, so tags, comments and grants foll
 - Grants: every workspace user (`account users`) reads gold (masked) and the metric views; the deploying engineer
   reads every layer. vio_pii_readers is a workspace group, which Unity Catalog accepts in is_member() of the mask
   but not in GRANT.
+- Plain views: silver.booking_invoices, silver.booking_price_components and silver.accommodations. They have no
+  reader inside the pipeline, and a view costs one Unity Catalog table slot where a pipeline materialized view
+  costs two (the table and its hidden __materialization table); the Free Edition metastore holds 500 tables.
 - Metric views: gold.booking_metrics, gold.service_metrics, gold.receivable_metrics (YAML, version 1.1), the
   definitions Genie and the dashboard share.
 """
@@ -49,30 +52,54 @@ PII_TABLES = [
 ]
 STREAMING = ("bronze.", "silver.bookings", "silver.accommodation_details") + tuple(MASK_AFTER)
 
+SILVER_VIEWS = {
+    "booking_invoices": (
+        "Invoices issued by Travel Compositor for a booking (number, target, creation date).",
+        """SELECT b.booking_ref, x.value:number::string AS invoice_number, x.value:target::string AS target,
+               to_date(x.value:creationDate::string) AS created_date
+        FROM {c}.silver.bookings b, LATERAL variant_explode(b.payload:invoices) x""",
+    ),
+    "booking_price_components": (
+        "Price breakdown of a booking, one row per component (totalPrice, netProvider, operatorFee ...).",
+        """SELECT b.booking_ref, x.key AS component,
+               x.value:microsite.currency::string AS currency, x.value:microsite.amount::decimal(18,2) AS amount,
+               x.value:operator.currency::string AS operator_currency,
+               x.value:operator.amount::decimal(18,2) AS operator_amount
+        FROM {c}.silver.bookings b, LATERAL variant_explode(b.payload:pricebreakdown) x
+        WHERE x.value:microsite.amount IS NOT NULL""",
+    ),
+    "accommodations": (
+        "Accommodation catalog of Travel Compositor, current version (open rows of accommodations_history).",
+        """SELECT * EXCEPT (__START_AT, __END_AT) FROM {c}.silver.accommodations_history WHERE __END_AT IS NULL""",
+    ),
+}
+
+# Join names differ from every dimension name: identifiers are case-insensitive, so a join called agency next to
+# the dimension Agency resolves agency.agency_name against the dimension (INVALID_EXTRACT_BASE_FIELD_TYPE).
 METRIC_VIEWS = {
     "booking_metrics": """
 version: 1.1
 comment: Bookings of Vio Travel by creation date, agency and status. Amounts in the booking currency (USD).
 source: {c}.gold.fact_booking
 joins:
-  - name: agency
+  - name: dim_agency
     source: {c}.gold.dim_agency
-    on: source.agency_key = agency.agency_key
-  - name: created
+    on: source.agency_key = dim_agency.agency_key
+  - name: created_date
     source: {c}.gold.dim_date
-    on: source.created_date_key = created.date_key
-  - name: idea
+    on: source.created_date_key = created_date.date_key
+  - name: dim_travel_idea
     source: {c}.gold.dim_travel_idea
-    on: source.idea_key = idea.idea_key
+    on: source.idea_key = dim_travel_idea.idea_key
 dimensions:
   - name: Created month
-    expr: created.year_month
+    expr: created_date.year_month
   - name: Created year
-    expr: created.year
+    expr: created_date.year
   - name: Agency
-    expr: agency.agency_name
+    expr: dim_agency.agency_name
   - name: Agency country
-    expr: agency.country
+    expr: dim_agency.country
   - name: Status
     expr: status
   - name: Trip type
@@ -80,7 +107,7 @@ dimensions:
   - name: Source market
     expr: source_market_name
   - name: Travel idea
-    expr: idea.title
+    expr: dim_travel_idea.title
 measures:
   - name: Bookings
     expr: COUNT(1)
@@ -140,12 +167,12 @@ version: 1.1
 comment: Payments still due on bookings, by agency, due date and ageing bucket.
 source: {c}.gold.fact_pending_payment
 joins:
-  - name: agency
+  - name: dim_agency
     source: {c}.gold.dim_agency
-    on: source.agency_key = agency.agency_key
+    on: source.agency_key = dim_agency.agency_key
 dimensions:
   - name: Agency
-    expr: agency.agency_name
+    expr: dim_agency.agency_name
   - name: Ageing bucket
     expr: ageing_bucket
   - name: Due month
@@ -208,6 +235,12 @@ def main():
     for t in PII_TABLES:
         if exists(t):
             run(f"ALTER {kind(t)} {c}.{t} SET TAGS ('contains_pii' = 'true')")
+    # The service principal owns the pipeline tables. The catalog owner (the engineer running this job) grants
+    # itself MODIFY on the history tables, which ALTER ... SET MASK requires.
+    engineer = spark.sql("SELECT current_user()").first()[0]
+    for t in MASK_AFTER:
+        if exists(t):
+            run(f"GRANT MODIFY ON TABLE {c}.{t} TO `{engineer}`")
     for t, cols in PII_COLUMNS.items():
         if not exists(t):
             continue
@@ -216,13 +249,15 @@ def main():
             if t in MASK_AFTER:
                 run(f"ALTER {kind(t)} {c}.{t} ALTER COLUMN {col} SET MASK {c}.governance.mask_pii")
 
+    for name, (comment, query) in SILVER_VIEWS.items():
+        run(f"CREATE OR REPLACE VIEW {c}.silver.{name} COMMENT '{comment}' AS {query.format(c=c)}")
+
     for name, yaml in METRIC_VIEWS.items():
         run(f"CREATE OR REPLACE VIEW {c}.gold.{name} WITH METRICS LANGUAGE YAML AS $$\n{yaml.format(c=c)}$$")
 
     # Least privilege: readers get the model, not the raw layers. The engineer who deploys the bundle (this job runs
     # as that user) owns the catalog but not the tables the service principal creates, so reads every layer through
     # an explicit grant.
-    engineer = spark.sql("SELECT current_user()").first()[0]
     for stmt in [
         f"GRANT USE CATALOG ON CATALOG {c} TO `account users`",
         f"GRANT USE SCHEMA, SELECT ON SCHEMA {c}.gold TO `account users`",

@@ -319,6 +319,16 @@ def fact_booking_service():
     name=f"{G}.fact_booking_payment",
     comment="One payment recorded on a booking (first, second, additional, manual), in the payment currency.",
     cluster_by_auto=True,
+    schema="""payment_key STRING NOT NULL, booking_ref STRING NOT NULL, agency_key STRING NOT NULL,
+              payment_kind STRING, payment_id STRING, payment_system STRING, payment_type STRING, currency STRING,
+              amount DECIMAL(18,2), deferred_amount DECIMAL(18,2), paid_date_key INT, deferred_limit_date_key INT,
+              refund_status STRING,
+              CONSTRAINT fact_booking_payment_pk PRIMARY KEY (payment_key) RELY,
+              CONSTRAINT fact_booking_payment_booking_fk FOREIGN KEY (booking_ref) REFERENCES {G}.fact_booking,
+              CONSTRAINT fact_booking_payment_agency_fk FOREIGN KEY (agency_key) REFERENCES {G}.dim_agency,
+              CONSTRAINT fact_booking_payment_paid_fk FOREIGN KEY (paid_date_key) REFERENCES {G}.dim_date""".replace(
+        "{G}", G
+    ),
 )
 def fact_booking_payment():
     return spark.sql(f"""
@@ -334,6 +344,15 @@ def fact_booking_payment():
     name=f"{G}.fact_pending_payment",
     comment="One payment still due according to the latest pending-payments snapshot; days_overdue > 0 is late.",
     cluster_by_auto=True,
+    # no foreign key on booking_ref: a payment can be due on a booking that the incremental read has not landed yet
+    schema="""payment_id STRING NOT NULL, booking_ref STRING, agency_key STRING NOT NULL, payment_number INT,
+              currency STRING, amount_to_pay DECIMAL(18,2), deferred_amount DECIMAL(18,2), due_date DATE,
+              due_date_key INT, days_overdue INT, ageing_bucket STRING, booking_status STRING,
+              CONSTRAINT fact_pending_payment_pk PRIMARY KEY (payment_id) RELY,
+              CONSTRAINT fact_pending_payment_agency_fk FOREIGN KEY (agency_key) REFERENCES {G}.dim_agency,
+              CONSTRAINT fact_pending_payment_due_fk FOREIGN KEY (due_date_key) REFERENCES {G}.dim_date""".replace(
+        "{G}", G
+    ),
 )
 def fact_pending_payment():
     return spark.sql(f"""
@@ -355,6 +374,16 @@ def fact_pending_payment():
     name=f"{G}.fact_booking_status_change",
     comment="One tracked change of a booking (status, amounts, dates, pax) with the previous status.",
     cluster_by_auto=True,
+    schema="""booking_ref STRING NOT NULL, valid_from TIMESTAMP NOT NULL, valid_to TIMESTAMP, change_date_key INT,
+              previous_status STRING, status STRING, agency_key STRING NOT NULL, currency STRING,
+              total_price DECIMAL(18,2), total_price_change DECIMAL(18,2), paid_amount DECIMAL(18,2), pax INT,
+              start_date DATE, end_date DATE,
+              CONSTRAINT fact_booking_status_change_pk PRIMARY KEY (booking_ref, valid_from) RELY,
+              CONSTRAINT fact_booking_status_change_booking_fk FOREIGN KEY (booking_ref) REFERENCES {G}.fact_booking,
+              CONSTRAINT fact_booking_status_change_agency_fk FOREIGN KEY (agency_key) REFERENCES {G}.dim_agency,
+              CONSTRAINT fact_booking_status_change_date_fk FOREIGN KEY (change_date_key) REFERENCES {G}.dim_date""".replace(
+        "{G}", G
+    ),
 )
 def fact_booking_status_change():
     return spark.sql(f"""
@@ -362,7 +391,7 @@ def fact_booking_status_change():
                {date_key("__START_AT.last_update_at")} AS change_date_key,
                lag(status) OVER w AS previous_status, status,
                coalesce(agency_id, '{UNKNOWN}') AS agency_key, currency, total_price,
-               total_price - lag(total_price) OVER w AS total_price_change,
+               CAST(total_price - lag(total_price) OVER w AS DECIMAL(18,2)) AS total_price_change,
                paid_amount, pax, start_date, end_date
         FROM {S}.bookings_history
         WINDOW w AS (PARTITION BY booking_ref ORDER BY __START_AT)""")
@@ -372,6 +401,15 @@ def fact_booking_status_change():
     name=f"{G}.fact_purchase_attempt",
     comment="One checkout started on the microsite; is_converted when a booking carries the same idea id.",
     cluster_by_auto=True,
+    schema="""attempt_id STRING NOT NULL, created_date_key INT, trip_type STRING, currency STRING,
+              total_price DECIMAL(18,2), destination_count INT, hotel_nights INT, adults INT,
+              converted_booking_ref STRING, is_converted BOOLEAN,
+              CONSTRAINT fact_purchase_attempt_pk PRIMARY KEY (attempt_id) RELY,
+              CONSTRAINT fact_purchase_attempt_booking_fk FOREIGN KEY (converted_booking_ref)
+                REFERENCES {G}.fact_booking,
+              CONSTRAINT fact_purchase_attempt_date_fk FOREIGN KEY (created_date_key) REFERENCES {G}.dim_date""".replace(
+        "{G}", G
+    ),
 )
 def fact_purchase_attempt():
     return spark.sql(f"""
@@ -387,7 +425,8 @@ def fact_purchase_attempt():
 @dp.materialized_view(
     name=f"{G}.obt_booking_service",
     comment="fact_booking_service joined with every dimension and booking attribute, for ad-hoc SQL and Genie.",
-    cluster_by=["booking_created_month"],
+    # a clustering column needs statistics, which Delta keeps for the first 32 columns only; the month comes later
+    cluster_by=["booking_created_date_key"],
 )
 def obt_booking_service():
     return spark.sql(f"""

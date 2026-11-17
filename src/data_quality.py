@@ -149,7 +149,15 @@ def main():
             "alert",
             f"""SELECT 'fact_booking ' || booking_ref AS k FROM {g}.fact_booking GROUP BY booking_ref HAVING count(*) > 1
             UNION ALL SELECT 'fact_booking_service ' || service_key FROM {g}.fact_booking_service
-              GROUP BY service_key HAVING count(*) > 1""",
+              GROUP BY service_key HAVING count(*) > 1
+            UNION ALL SELECT 'fact_booking_payment ' || payment_key FROM {g}.fact_booking_payment
+              GROUP BY payment_key HAVING count(*) > 1
+            UNION ALL SELECT 'fact_pending_payment ' || payment_id FROM {g}.fact_pending_payment
+              GROUP BY payment_id HAVING count(*) > 1
+            UNION ALL SELECT 'fact_booking_status_change ' || booking_ref || ' ' || valid_from
+              FROM {g}.fact_booking_status_change GROUP BY booking_ref, valid_from HAVING count(*) > 1
+            UNION ALL SELECT 'fact_purchase_attempt ' || attempt_id FROM {g}.fact_purchase_attempt
+              GROUP BY attempt_id HAVING count(*) > 1""",
         ),
         "gold_fact_orphans": (
             "alert",
@@ -164,7 +172,28 @@ def main():
             UNION ALL SELECT 'service_type ' || f.service_key FROM {g}.fact_booking_service f
               LEFT ANTI JOIN {g}.dim_service_type d ON d.service_type = f.service_type
             UNION ALL SELECT 'accommodation ' || f.service_key FROM {g}.fact_booking_service f
-              LEFT ANTI JOIN {g}.dim_accommodation d ON d.accommodation_key = f.accommodation_key""",
+              LEFT ANTI JOIN {g}.dim_accommodation d ON d.accommodation_key = f.accommodation_key
+            UNION ALL SELECT 'payment booking ' || f.payment_key FROM {g}.fact_booking_payment f
+              LEFT ANTI JOIN {g}.fact_booking d ON d.booking_ref = f.booking_ref
+            UNION ALL SELECT 'payment agency ' || f.payment_key FROM {g}.fact_booking_payment f
+              LEFT ANTI JOIN {g}.dim_agency d ON d.agency_key = f.agency_key
+            UNION ALL SELECT 'pending agency ' || f.payment_id FROM {g}.fact_pending_payment f
+              LEFT ANTI JOIN {g}.dim_agency d ON d.agency_key = f.agency_key
+            UNION ALL SELECT 'change booking ' || f.booking_ref FROM {g}.fact_booking_status_change f
+              LEFT ANTI JOIN {g}.fact_booking d ON d.booking_ref = f.booking_ref
+            UNION ALL SELECT 'change agency ' || f.booking_ref FROM {g}.fact_booking_status_change f
+              LEFT ANTI JOIN {g}.dim_agency d ON d.agency_key = f.agency_key
+            UNION ALL SELECT 'attempt booking ' || f.attempt_id FROM {g}.fact_purchase_attempt f
+              LEFT ANTI JOIN {g}.fact_booking d ON d.booking_ref = f.converted_booking_ref
+              WHERE f.converted_booking_ref IS NOT NULL
+            UNION ALL SELECT 'date ' || k FROM (
+              SELECT created_date_key AS k FROM {g}.fact_booking UNION ALL
+              SELECT booking_created_date_key FROM {g}.fact_booking_service UNION ALL
+              SELECT paid_date_key FROM {g}.fact_booking_payment UNION ALL
+              SELECT due_date_key FROM {g}.fact_pending_payment UNION ALL
+              SELECT change_date_key FROM {g}.fact_booking_status_change UNION ALL
+              SELECT created_date_key FROM {g}.fact_purchase_attempt) x
+              WHERE k IS NOT NULL AND k NOT IN (SELECT date_key FROM {g}.dim_date)""",
         ),
         "gold_totals_match_silver": (
             "alert",

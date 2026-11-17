@@ -624,9 +624,14 @@ def plan(sales, purchases, limit, retry=frozenset()):
         d = doc_decision(p, reason, retry)
         if d == "HELD":
             held.append(("purchase", p["purchase_key"], p["payload_hash"], reason))
-        elif d == "SEND" and p["booking_ref"] in by_ref:
-            by_ref[p["booking_ref"]]["_purchases"].append(p)
-    pending = sorted((s for s in sales if s["_send"] or s["_purchases"]), key=lambda s: s.get("last_update_at") or "")
+        elif d == "SEND":
+            # a booking whose services all sell at 0 has no sales invoice but can still owe its suppliers
+            stub = {"external_document_number": p["booking_ref"], "doc_action": None, "_decision": "NONE"}
+            stub.update(_send=False, _purchases=[], last_update_at=p.get("invoice_date"))
+            by_ref.setdefault(p["booking_ref"], stub)["_purchases"].append(p)
+    pending = sorted(
+        (s for s in by_ref.values() if s["_send"] or s["_purchases"]), key=lambda s: str(s.get("last_update_at") or "")
+    )
     return pending[:limit], held, len(pending)
 
 
@@ -661,6 +666,8 @@ def doc_queries(c, company, g, scope):
     """SQL for the sales and purchase documents in scope with their sync state, and for the documents synced
     before that are no longer in the published tables. scope filters sales_invoices, alias i."""
     with_state = state_sql(c, company)
+    # a purchase whose booking has no sales invoice (every service sold at 0) falls back to its own invoice date
+    purchase_scope = scope.replace("i.invoice_date", "coalesce(i.invoice_date, p.invoice_date)")
     sales = f"""{with_state}
         SELECT i.*, {STATE_COLS}, coalesce(fl.failures, 0) AS failures
         FROM {g["sales_invoices"]} i
@@ -671,10 +678,10 @@ def doc_queries(c, company, g, scope):
     purchases = f"""{with_state}
         SELECT p.*, i.hold_reason AS sales_hold_reason, {STATE_COLS}, coalesce(fl.failures, 0) AS failures
         FROM {g["purchase_invoices"]} p
-        JOIN {g["sales_invoices"]} i ON i.external_document_number = p.booking_ref
+        LEFT JOIN {g["sales_invoices"]} i ON i.external_document_number = p.booking_ref
         LEFT JOIN st ON st.doc_type = 'purchase' AND st.doc_key = p.purchase_key
         LEFT JOIN fl ON fl.doc_type = 'purchase' AND fl.doc_key = p.purchase_key AND fl.payload_hash = p.payload_hash
-        WHERE {scope}"""
+        WHERE {purchase_scope}"""
     removed = f"""{with_state}
         SELECT st.doc_type, st.doc_key, st.attempt_result FROM st
         LEFT ANTI JOIN (SELECT 'sales' AS doc_type, external_document_number AS doc_key FROM {g["sales_invoices"]}

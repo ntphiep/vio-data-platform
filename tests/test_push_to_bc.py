@@ -282,6 +282,26 @@ def test_purchase_of_held_sales_invoice_is_recorded_held_with_reason():
     ]
 
 
+def test_purchase_of_booking_without_sales_invoice_is_still_sent():
+    purchases = [doc(purchase_key="9-H", booking_ref="B9", invoice_date="2026-11-02", payload_hash="P9")]
+    todo, held, pending = m.plan([], purchases, 10)
+    assert held == [] and pending == 1
+    assert todo[0]["external_document_number"] == "B9" and not todo[0]["_send"]
+    assert [p["purchase_key"] for p in todo[0]["_purchases"]] == ["9-H"]
+
+
+def test_purchase_scope_falls_back_to_the_purchase_invoice_date():
+    q = m.doc_queries(
+        "vio_travel",
+        "My Company",
+        {"sales_invoices": "s", "purchase_invoices": "p"},
+        "(i.invoice_date >= date_sub(current_date(), 30))",
+    )
+    assert "LEFT JOIN s i ON" in q["purchases"]
+    assert "coalesce(i.invoice_date, p.invoice_date) >= date_sub" in q["purchases"]
+    assert "WHERE (i.invoice_date >= date_sub" in q["sales"]
+
+
 def test_plan_skips_done_bookings_before_the_limit_so_new_ones_are_not_starved():
     done = [
         doc(

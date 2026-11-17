@@ -26,29 +26,8 @@ S, G = f"{C}.silver", f"{C}.gold"
 MASK = f"MASK {C}.governance.mask_pii"
 UNKNOWN = "-1"
 ACTIVE = "('BOOKED', 'RQ')"
-SERVICE_ARRAYS = [
-    "hotelservice",
-    "transferservice",
-    "transportservice",
-    "ticketservice",
-    "closedtourservice",
-    "carservice",
-    "insuranceservice",
-    "cruiseservice",
-    "itemservice",
-]
-MANUAL_KEYS = [
-    "hotel",
-    "transfer",
-    "transport",
-    "ticket",
-    "closedTour",
-    "carRental",
-    "cruise",
-    "insurance",
-    "other",
-    "accountingAdjustment",
-]
+# The username is often an e-mail address, so the user key is a hash; the same expression builds silver.users.user_key.
+USER_KEY = "sha2(b.agency_id || ':' || b.username, 256)"
 CATEGORY = {
     "hotelservice": "Hotel",
     "transferservice": "Transfer",
@@ -198,10 +177,10 @@ def dim_user():
                country, profile, active, b2c
         FROM {S}.users
         UNION ALL
-        SELECT b.agency_id || ':' || b.username, b.agency_id, max(b.username), NULL, NULL, NULL, NULL, NULL, NULL
+        SELECT {USER_KEY}, b.agency_id, max(b.username), NULL, NULL, NULL, NULL, NULL, NULL
         FROM {S}.bookings b
         WHERE b.username IS NOT NULL AND b.agency_id IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM {S}.users u WHERE u.user_key = b.agency_id || ':' || b.username)
+          AND NOT EXISTS (SELECT 1 FROM {S}.users u WHERE u.user_key = {USER_KEY})
         GROUP BY 1, 2
         UNION ALL
         SELECT '{UNKNOWN}', NULL, 'Unknown', NULL, NULL, NULL, NULL, NULL, NULL""")
@@ -217,7 +196,7 @@ def dim_user():
 )
 def dim_travel_idea():
     return spark.sql(f"""
-        SELECT idea_id, title, trip_type, active, created_date, departure_date, currency, price_per_person,
+        SELECT idea_id AS idea_key, title, trip_type, active, created_date, departure_date, currency, price_per_person,
                total_price, destination_count, hotel_nights, destinations, idea_url
         FROM {S}.travel_ideas
         UNION ALL
@@ -240,13 +219,14 @@ def dim_travel_idea():
 def dim_accommodation():
     return spark.sql(f"""
         WITH booked AS (
-          SELECT h.value:hotelId::string AS id, max(h.value:hotelName::string) AS name,
-                 max(upper(h.value:country::string)) AS country, max(initcap(h.value:destinationName::string)) AS dest
-          FROM {S}.bookings b, LATERAL variant_explode(b.payload:hotelservice) h
-          WHERE h.value:hotelId IS NOT NULL GROUP BY 1)
-        SELECT k.id, coalesce(d.name, k.name), d.accommodation_type, d.category, d.chain,
-               coalesce(d.destination_name, k.dest), k.country, d.latitude, d.longitude, d.rating_score_10,
-               d.rating_reviews, d.accommodation_id IS NOT NULL
+          SELECT accommodation_id AS id, max(name) AS name, max(destination_country) AS country,
+                 max(destination_name) AS dest
+          FROM {S}.booking_services
+          WHERE service_type = 'hotelservice' AND accommodation_id IS NOT NULL GROUP BY 1)
+        SELECT k.id AS accommodation_key, coalesce(d.name, k.name) AS accommodation_name, d.accommodation_type,
+               d.category, d.chain, coalesce(d.destination_name, k.dest) AS destination_name, k.country,
+               d.latitude, d.longitude, d.rating_score_10, CAST(d.rating_reviews AS INT) AS rating_reviews,
+               d.accommodation_id IS NOT NULL AS has_datasheet
         FROM booked k LEFT JOIN {S}.accommodation_details d ON d.accommodation_id = k.id
         UNION ALL
         SELECT '{UNKNOWN}', 'Unknown', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, false""")
@@ -277,7 +257,7 @@ def fact_booking():
     return spark.sql(f"""
         SELECT b.booking_ref, coalesce(b.agency_id, '{UNKNOWN}') AS agency_key,
                CASE WHEN b.username IS NOT NULL AND b.agency_id IS NOT NULL
-                    THEN b.agency_id || ':' || b.username ELSE '{UNKNOWN}' END AS user_key,
+                    THEN {USER_KEY} ELSE '{UNKNOWN}' END AS user_key,
                coalesce(nullif(b.idea_id, ''), '{UNKNOWN}') AS idea_key,
                {date_key("b.created_at")} AS created_date_key, {date_key("b.start_date")} AS start_date_key,
                {date_key("b.end_date")} AS end_date_key, b.status, b.status IN {ACTIVE} AS is_active,
@@ -294,22 +274,6 @@ def fact_booking():
           ON n.booking_ref = b.booking_ref
         LEFT JOIN (SELECT booking_ref, sum(amount_to_pay) AS pending FROM {S}.pending_payments GROUP BY 1) p
           ON p.booking_ref = b.booking_ref""")
-
-
-def _service_destination_sql() -> str:
-    parts = [
-        f"""SELECT b.booking_ref, '{t}' AS service_type, x.value:id::string AS id, x.value:country::string AS country,
-                   coalesce(x.value:destinationName::string, x.value:locationName::string) AS dname
-            FROM {S}.bookings b, LATERAL variant_explode(b.payload:{t}) x"""
-        for t in SERVICE_ARRAYS
-    ] + [
-        f"""SELECT b.booking_ref, 'manual_{k}', x.value:id::string, x.value:country::string, x.value:destination::string
-            FROM {S}.bookings b, LATERAL variant_explode(b.payload:manualServices.{k}) x"""
-        for k in MANUAL_KEYS
-    ]
-    return f"""SELECT booking_ref, service_type, id, max(upper(country)) AS country,
-                      max(initcap(dname)) AS destination_name
-               FROM ({" UNION ALL ".join(parts)}) WHERE id IS NOT NULL GROUP BY 1, 2, 3"""
 
 
 @dp.materialized_view(
@@ -333,7 +297,6 @@ def _service_destination_sql() -> str:
 )
 def fact_booking_service():
     return spark.sql(f"""
-        WITH dest AS ({_service_destination_sql()})
         SELECT x.booking_ref || '|' || x.service_type || '|' || x.service_id AS service_key,
                x.booking_ref, x.service_id, x.service_type, {supplier_key_sql("x")} AS supplier_key,
                coalesce(b.agency_id, '{UNKNOWN}') AS agency_key,
@@ -342,15 +305,14 @@ def fact_booking_service():
                {date_key("b.created_at")} AS booking_created_date_key,
                {date_key("x.start_date")} AS service_start_date_key,
                x.status, x.status IN {ACTIVE} AS is_active, x.is_manual,
-               d.country AS destination_country, d.destination_name,
+               x.destination_country, x.destination_name,
                x.sale_currency, x.sale_amount, x.cost_currency, x.cost_amount,
                b.currency AS booking_currency, x.cost_in_sale_currency AS cost_in_booking_currency,
                CAST(CASE WHEN x.sale_currency = b.currency THEN x.sale_amount - x.cost_in_sale_currency END
                     AS DECIMAL(18,2)) AS margin_in_booking_currency,
                x.start_date, x.end_date
         FROM {S}.booking_services x
-        JOIN {S}.bookings b ON b.booking_ref = x.booking_ref
-        LEFT JOIN dest d ON d.booking_ref = x.booking_ref AND d.service_type = x.service_type AND d.id = x.service_id""")
+        JOIN {S}.bookings b ON b.booking_ref = x.booking_ref""")
 
 
 @dp.materialized_view(
@@ -396,12 +358,14 @@ def fact_pending_payment():
 )
 def fact_booking_status_change():
     return spark.sql(f"""
-        SELECT booking_ref, __START_AT AS valid_from, __END_AT AS valid_to, {date_key("__START_AT")} AS change_date_key,
-               lag(status) OVER (PARTITION BY booking_ref ORDER BY __START_AT) AS previous_status, status,
+        SELECT booking_ref, __START_AT.last_update_at AS valid_from, __END_AT.last_update_at AS valid_to,
+               {date_key("__START_AT.last_update_at")} AS change_date_key,
+               lag(status) OVER w AS previous_status, status,
                coalesce(agency_id, '{UNKNOWN}') AS agency_key, currency, total_price,
-               total_price - lag(total_price) OVER (PARTITION BY booking_ref ORDER BY __START_AT) AS total_price_change,
+               total_price - lag(total_price) OVER w AS total_price_change,
                paid_amount, pax, start_date, end_date
-        FROM {S}.bookings_history""")
+        FROM {S}.bookings_history
+        WINDOW w AS (PARTITION BY booking_ref ORDER BY __START_AT)""")
 
 
 @dp.materialized_view(

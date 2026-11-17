@@ -17,6 +17,9 @@ resources:
             include: ../src/lakehouse/**
       configuration:
         vio.catalog: ${var.catalog}
+        # an update started by a job retries itself on retryable errors (default 5 times, each a full update);
+        # one retry is enough here and keeps a failing update from using up the daily compute quota
+        pipelines.numUpdateRetryAttempts: "1"
       # the event log as a Unity Catalog table, read by the task data_quality and the dashboard page Operations
       event_log:
         catalog: ${var.catalog}
@@ -27,10 +30,6 @@ resources:
       notifications:
         - email_recipients: [ "${workspace.current_user.userName}" ]
           alerts: [ on-update-failure, on-update-fatal-failure, on-flow-failure ]
-      # the jobs that start updates run as the service principal; the bundle-wide CAN_VIEW cannot start one
-      permissions:
-        - level: CAN_RUN
-          service_principal_name: ${var.pipeline_sp}
       tags:
         project: vio_travel
         contains_pii: "true"

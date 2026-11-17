@@ -7,7 +7,9 @@ Idempotent; runs after each deploy and weekly, so tags, comments and grants foll
   history tables, which the pipeline creates without a schema.
 - Tags: table tag contains_pii and column tag pii (email, phone, name, address) on every personal column, so the
   columns can be found with information_schema.column_tags.
-- Grants: group vio_analysts reads gold (masked) and the metric views; vio_pii_readers also reads silver.
+- Grants: every workspace user (`account users`) reads gold (masked) and the metric views; the deploying engineer
+  reads every layer. vio_pii_readers is a workspace group, which Unity Catalog accepts in is_member() of the mask
+  but not in GRANT.
 - Metric views: gold.booking_metrics, gold.service_metrics, gold.receivable_metrics (YAML, version 1.1), the
   definitions Genie and the dashboard share.
 """
@@ -217,14 +219,14 @@ def main():
     for name, yaml in METRIC_VIEWS.items():
         run(f"CREATE OR REPLACE VIEW {c}.gold.{name} WITH METRICS LANGUAGE YAML AS $$\n{yaml.format(c=c)}$$")
 
-    # Least privilege: analysts read the model, not the raw layers; PII readers also read silver.
+    # Least privilege: readers get the model, not the raw layers. The engineer who deploys the bundle (this job runs
+    # as that user) owns the catalog but not the tables the service principal creates, so reads every layer through
+    # an explicit grant.
+    engineer = spark.sql("SELECT current_user()").first()[0]
     for stmt in [
-        f"GRANT USE CATALOG ON CATALOG {c} TO `vio_analysts`",
-        f"GRANT USE SCHEMA, SELECT ON SCHEMA {c}.gold TO `vio_analysts`",
-        f"GRANT EXECUTE ON FUNCTION {c}.governance.mask_pii TO `vio_analysts`",
-        f"GRANT USE CATALOG ON CATALOG {c} TO `vio_pii_readers`",
-        f"GRANT USE SCHEMA, SELECT ON SCHEMA {c}.silver TO `vio_pii_readers`",
-        f"GRANT USE SCHEMA, SELECT ON SCHEMA {c}.gold TO `vio_pii_readers`",
+        f"GRANT USE CATALOG ON CATALOG {c} TO `account users`",
+        f"GRANT USE SCHEMA, SELECT ON SCHEMA {c}.gold TO `account users`",
+        f"GRANT USE SCHEMA, SELECT, READ VOLUME, EXECUTE ON CATALOG {c} TO `{engineer}`",
     ]:
         run(stmt)
 

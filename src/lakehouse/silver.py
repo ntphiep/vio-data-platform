@@ -129,7 +129,9 @@ dp.create_auto_cdc_flow(
     target=f"{S}.bookings_history",
     source="bookings_changes",
     keys=["booking_ref"],
-    sequence_by="last_update_at",
+    # ingested_at breaks ties between two landings of the same version; __START_AT and __END_AT are then structs
+    # of (last_update_at, ingested_at)
+    sequence_by=F.struct("last_update_at", "ingested_at"),
     column_list=[
         "booking_ref",
         "status",
@@ -160,17 +162,22 @@ dp.create_auto_cdc_flow(
 
 
 def _explode_services(cols: str) -> str:
-    typed = [
-        f"""SELECT b.booking_ref, '{t}' AS service_type, false AS is_manual, s.value AS s, b.last_update_at
-            FROM {S}.bookings b, LATERAL variant_explode(b.payload:{t}) s"""
-        for t in SERVICE_ARRAYS
-    ]
-    manual = [
-        f"""SELECT b.booking_ref, 'manual_{k}' AS service_type, true AS is_manual, s.value AS s, b.last_update_at
-            FROM {S}.bookings b, LATERAL variant_explode(b.payload:manualServices.{k}) s"""
-        for k in MANUAL_KEYS
-    ]
-    return f"SELECT {cols} FROM ({' UNION ALL '.join(typed + manual)})"
+    """Two scans of silver.bookings (typed arrays, then manualServices) instead of one scan per array.
+
+    A materialized view keeps one row-id field pair per UNION branch; with one branch per array (19) those fields
+    took the 32 statistics columns of Delta and the clustering key booking_ref lost its statistics
+    (DELTA_CLUSTERING_COLUMN_MISSING_STATS).
+    """
+    typed = ", ".join(f"'{t}'" for t in SERVICE_ARRAYS)
+    manual = ", ".join(f"'{k}'" for k in MANUAL_KEYS)
+    return f"""SELECT {cols} FROM (
+        SELECT b.booking_ref, t.key AS service_type, false AS is_manual, s.value AS s, b.last_update_at
+        FROM {S}.bookings b, LATERAL variant_explode(b.payload) t, LATERAL variant_explode(t.value) s
+        WHERE t.key IN ({typed})
+        UNION ALL
+        SELECT b.booking_ref, 'manual_' || t.key, true, s.value, b.last_update_at
+        FROM {S}.bookings b, LATERAL variant_explode(b.payload:manualServices) t, LATERAL variant_explode(t.value) s
+        WHERE t.key IN ({manual}))"""
 
 
 @dp.materialized_view(
@@ -191,7 +198,9 @@ def booking_services():
            coalesce(s:supplierName::string, s:providerName::string) AS supplier_name,
            s:provider::string AS provider,
            coalesce(s:providerBookingReference::string, s:providerTransferCode::string) AS provider_reference,
-           s:hotelId::string AS accommodation_id,
+           s:hotelId::string AS accommodation_id, upper(s:country::string) AS destination_country,
+           initcap(coalesce(s:destinationName::string, s:locationName::string, s:destination::string))
+             AS destination_name,
            to_date(left(s:startDate::string,10)) AS start_date, to_date(left(s:endDate::string,10)) AS end_date,
            s:pricebreakdown.totalPrice.microsite.currency::string AS sale_currency,
            s:pricebreakdown.totalPrice.microsite.amount::decimal(18,2) AS sale_amount,
@@ -302,7 +311,7 @@ SNAPSHOTS = {
     ),
     "users": (
         ["user_key"],
-        """coalesce(r:agency::string, '-') || ':' || r:username::string AS user_key, r:agency::string AS agency_id,
+        """sha2(coalesce(r:agency::string, '-') || ':' || r:username::string, 256) AS user_key, r:agency::string AS agency_id,
            r:username::string AS username, r:name::string AS name, r:surname::string AS surname,
            r:email::string AS email, r:telephone::string AS telephone, r:country::string AS country,
            r:profile::string AS profile, r:active::boolean AS active, r:b2c::boolean AS b2c,
@@ -370,7 +379,8 @@ def snapshot_entity(entity: str, keys: list[str], cols: str, comment: str, schem
         name=f"{S}.{entity}_history",
         comment=f"History (SCD type 2) of {entity.replace('_', ' ')}: one row per version, __END_AT NULL = current.",
         cluster_by_auto=True,
-        table_properties=CDF,
+        # A full refresh would rebuild the history from the latest snapshot only, so it is not allowed.
+        table_properties={**CDF, "pipelines.reset.allowed": "false"},
     )
     dp.create_auto_cdc_from_snapshot_flow(
         target=f"{S}.{entity}_history",

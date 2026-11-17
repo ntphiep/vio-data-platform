@@ -14,8 +14,9 @@ Design
                  --datasheet_refresh_days, at most --datasheet_cap per run.
 - Offset paging (`first`/`limit`) can shift while a list changes. Every window and snapshot is reconciled: distinct
   keys landed vs `totalResults`. A short booking window is read once more; if it is still short it is recorded as
-  PARTIAL and the watermark stays. A short snapshot is PARTIAL and an empty one EMPTY; neither is used as a
-  snapshot, because the pipeline closes every key missing from a snapshot.
+  PARTIAL and the watermark stays. A short snapshot is read a second time: the same keys again means the count
+  overstates and the snapshot is used; other keys make it PARTIAL. An empty snapshot is EMPTY. PARTIAL and EMPTY
+  are never used, because the pipeline closes every key missing from a snapshot.
 - Each API page is landed unchanged as one gzip NDJSON file (one record per line, with run metadata), so parsing
   bugs are fixed by replaying raw files instead of calling the API again.
 - Retries: exponential backoff with full jitter on 429, 5xx and network errors, honouring Retry-After; a 401 gets
@@ -244,6 +245,13 @@ def read_snapshot(tc, spec, land, threads=1, today=None):
     return acc["pages"], acc["records"], acc["bytes"], acc["keys"], total
 
 
+def snapshot_status(keys, total, again):
+    """Status of a snapshot that came back with fewer distinct keys than totalResults, after a second read."""
+    if again == keys:
+        return "SUCCESS", f"stable: {len(keys)} distinct on two reads, totalResults says {total}"
+    return "PARTIAL", f"{len(keys)} distinct of {total} expected; a second read gave {len(again)} different keys"
+
+
 def read_datasheets(tc, ids, land, threads=1):
     """Fetch /accommodations/{id}/datasheet for each id. Returns {id: status} with OK, NOT_FOUND or FAILED."""
     out, lock = {}, threading.Lock()
@@ -439,7 +447,10 @@ def main():
                 elif not keys:
                     st, err = "EMPTY", "no records; previous snapshot stays in force"
                 elif len(keys) < total:
-                    st, err = "PARTIAL", f"{len(keys)} distinct of {total} expected"
+                    # Read the list again without landing it: the same keys twice means totalResults overstates
+                    # (pending payments report 575 and list 574); different keys mean the list moved under paging.
+                    again = read_snapshot(tc, spec, lambda recs, meta: 0, a.threads, today)[3]
+                    st, err = snapshot_status(keys, total, again)
             except Exception as e:  # noqa: BLE001 - record the failure, the next run retries
                 st, err = "FAILED", repr(e)[:1000]
             summaries.append(
@@ -492,7 +503,10 @@ def main():
     finally:
         flush()
 
-    bad = [s for s in done if s[11] == "FAILED"]
+    # A bounded backfill window that is PARTIAL also fails the task: the job vio_travel_backfill is resumed with
+    # "Repair run", which re-runs only the failed for_each iterations. A regular run leaves PARTIAL to the next run
+    # (the watermark stays) and to the check e2e_extract_failing_or_stale.
+    bad = [s for s in done if s[11] == "FAILED" or (bounded and s[11] == "PARTIAL")]
     if bad:
         raise RuntimeError(f"{len(bad)} extract(s) failed, see {ops}.ingest_runs run_id={run_id}")
 

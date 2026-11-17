@@ -20,12 +20,12 @@ variables:
       the API; it is in the group vio_pii_readers and has READ on the secret scope vio-tc
     default: 82205f93-7db0-4ca5-9d78-63bd916ac9db
 
-# The bundle folder, jobs and pipeline: the deploying user manages them, the service principal that runs them
-# reads the deployed files.
+# The bundle folder, jobs and pipeline: the deploying user manages them; the service principal that runs them
+# reads the deployed files and may start pipeline updates.
 permissions:
   - level: CAN_MANAGE
     user_name: ${workspace.current_user.userName}
-  - level: CAN_VIEW
+  - level: CAN_RUN
     service_principal_name: ${var.pipeline_sp}
 
 targets:

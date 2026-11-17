@@ -52,8 +52,8 @@ resources:
         - task_key: lakehouse
           depends_on:
             - task_key: extract_tc
-          max_retries: 1
-          min_retry_interval_millis: 120000
+          # no task retry: the pipeline retries the update itself (pipelines.numUpdateRetryAttempts)
+          max_retries: 0
           pipeline_task:
             pipeline_id: ${resources.pipelines.vio_travel_lakehouse.id}
             full_refresh: false

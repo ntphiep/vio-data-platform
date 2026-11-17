@@ -16,7 +16,12 @@ The SQL alert pipeline_freshness covers the case where the job itself stops runn
 import argparse
 import json
 
-SYNCED = "('CREATED', 'UPDATED', 'RECREATED', 'CANCELLED_DRAFT_EMPTIED')"  # same as local/push_to_bc.py
+# same result groups as local/push_to_bc.py: a document is done when its latest attempt is terminal for its hash
+TERMINAL = (
+    "('CREATED', 'UPDATED', 'RECREATED', 'CANCELLED_DRAFT_EMPTIED', 'NEEDS_CREDIT_MEMO', 'NOTHING_TO_CANCEL', "
+    "'NO_EXCHANGE_RATE', 'REMOVED_DRAFT_EMPTIED', 'REMOVED_POSTED', 'REMOVED_NOT_FOUND')"
+)
+ATTEMPT = TERMINAL[:-1] + ", 'FAILED')"
 MAX_FAILURES = 3
 # Minutes after which the last successful extract of an entity is stale: twice its cadence plus margin.
 STALE_MINUTES = {
@@ -49,25 +54,33 @@ def main():
     sql = spark.sql
     company = a.bc_company.replace("'", "''")
 
-    pub = sql(f"SELECT versions FROM {c}.ops.publish ORDER BY published_at DESC LIMIT 1").collect()
+    pub = (
+        sql(f"SELECT versions FROM {c}.ops.publish ORDER BY published_at DESC LIMIT 1").collect()
+        if spark.catalog.tableExists(f"{c}.ops.publish")
+        else []
+    )
     ver = json.loads(pub[0]["versions"]) if pub else {}
     sales = (
         f"{c}.business_central.sales_invoices VERSION AS OF {ver['sales_invoices']}"
         if "sales_invoices" in ver
         else f"(SELECT * FROM {c}.business_central.sales_invoices WHERE false)"
     )
-    # Sales documents of the last publish that the push has not delivered yet: the same rule and the same
-    # invoice-date scope as local/push_to_bc.py.
+    # Sales documents of the last publish that the push has not delivered yet: the same rule and the same scope as
+    # local/push_to_bc.py (latest attempt per key, terminal for the current hash; at most MAX_FAILURES failures).
     pending_sales = f"""(SELECT i.external_document_number AS k FROM {sales} i
-        LEFT ANTI JOIN (SELECT DISTINCT doc_key, payload_hash FROM {c}.ops.bc_sync
-                        WHERE doc_type = 'sales' AND result IN {SYNCED} AND bc_company = '{company}') s
-          ON s.doc_key = i.external_document_number AND s.payload_hash = i.payload_hash
+        LEFT JOIN (SELECT doc_key,
+                          max_by(payload_hash, synced_at) FILTER (WHERE result IN {ATTEMPT}) AS h,
+                          max_by(result, synced_at) FILTER (WHERE result IN {ATTEMPT}) AS r
+                   FROM {c}.ops.bc_sync WHERE doc_type = 'sales' AND bc_company = '{company}' GROUP BY doc_key) s
+          ON s.doc_key = i.external_document_number
         LEFT ANTI JOIN (SELECT doc_key, payload_hash FROM {c}.ops.bc_sync
                         WHERE doc_type = 'sales' AND result = 'FAILED' AND bc_company = '{company}'
                         GROUP BY ALL HAVING count(*) >= {MAX_FAILURES}) d
           ON d.doc_key = i.external_document_number AND d.payload_hash = i.payload_hash
         WHERE i.hold_reason IS NULL AND i.doc_action = 'UPSERT'
-          AND i.invoice_date >= date_sub(current_date(), {a.push_scope_days}))"""
+          AND NOT (s.r IS NOT NULL AND s.r IN {TERMINAL} AND s.h = i.payload_hash)
+          AND (i.invoice_date >= date_sub(current_date(), {a.push_scope_days})
+               OR to_date(i.last_update_at) >= date_sub(current_date(), {a.push_scope_days})))"""
     # last data change of silver.bookings (maintenance commits do not count)
     try:
         hist = sql(f"DESCRIBE HISTORY {c}.silver.bookings LIMIT 50").collect()
@@ -95,11 +108,12 @@ def main():
                OR coalesce(last_success, TIMESTAMP'1970-01-01')
                   < current_timestamp() - make_interval(0, 0, 0, 0, 0, CASE entity {stale} ELSE 780 END)""",
         ),
-        # the source itself went quiet: no booking changed in Travel Compositor for 48 hours
+        # the source itself went quiet: no booking changed in Travel Compositor for 48 hours (an empty
+        # silver.bookings counts as quiet)
         "e2e_source_not_updated_48h": (
             "alert",
-            f"""SELECT 'silver.bookings' AS k FROM {sv}.bookings
-            HAVING max(last_update_at) < current_timestamp() - INTERVAL 48 HOURS""",
+            f"""SELECT 'silver.bookings' AS k FROM (SELECT max(last_update_at) AS m FROM {sv}.bookings)
+            WHERE m IS NULL OR m < current_timestamp() - INTERVAL 48 HOURS""",
         ),
         # stage 2: landing -> bronze, silver, gold. The last pipeline update failed, or none completed lately.
         "e2e_pipeline_failed_or_stale": (
@@ -200,7 +214,14 @@ def main():
              payload_hash STRING, bc_company STRING, bc_id STRING, bc_number STRING, result STRING, error STRING)""")
     rows_out, alerts = [], []
     for name, (severity, q) in checks.items():
-        r = sql(f"SELECT count(*) AS n, slice(collect_list(k), 1, 5) AS s FROM ({q})").collect()[0]
+        try:
+            r = sql(f"SELECT count(*) AS n, slice(collect_list(k), 1, 5) AS s FROM ({q})").collect()[0]
+        except Exception as e:  # noqa: BLE001 - a check that cannot run (missing table) is itself an alert
+            msg = str(e).splitlines()[0][:300]
+            rows_out.append((a.run_id, name, "error", None, msg))
+            print(f"DQ error {name}: {msg}")
+            alerts.append(name)
+            continue
         rows_out.append((a.run_id, name, severity, r["n"], ",".join(r["s"] or [])))
         print(f"DQ {severity:5} {name}: {r['n']} sample={r['s']}")
         if r["n"] and severity == "alert":

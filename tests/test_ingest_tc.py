@@ -211,3 +211,8 @@ def test_snapshot_without_pagination_is_not_reconciled():
     tc, _, _, _ = client([Resp(200, b'{"agency": [{"id": 1}]}')])
     *_, total = m.read_snapshot(tc, m.SNAPSHOTS["agencies"], lambda recs, meta: 1)
     assert total is None
+
+
+def test_short_snapshot_is_used_only_when_a_second_read_agrees():
+    assert m.snapshot_status({1, 2}, 3, {1, 2})[0] == "SUCCESS"
+    assert m.snapshot_status({1, 2}, 3, {1, 3})[0] == "PARTIAL"

@@ -8,7 +8,8 @@
   "bc_local_currency": "AUD",
   "max_bookings_per_run": 100,
   "job_id": 347701809327858,
-  "scope_sql": "i.invoice_date >= date_sub(current_date(), 30)",
+  "scope_sql": "(i.invoice_date >= date_sub(current_date(), 30) OR to_date(i.last_update_at) >= date_sub(current_date(), 30))",
+  "max_removals_per_run": 50,
   "sales_gl_account": "4350",
   "purchase_gl_account": "5101",
   "customer_setup": {
@@ -19,5 +20,6 @@
     "vendorPostingGroup": "DOMESTIC",
     "genBusPostingGroup": "DOMESTIC"
   },
-  "fx_source": "https://api.frankfurter.dev/v1"
+  "fx_source": "https://api.frankfurter.dev/v1",
+  "no_series_lines_service": "NoSeriesLines"
 }

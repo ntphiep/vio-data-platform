@@ -5,10 +5,13 @@ Run: python3 genie/build_genie_space.py
 """
 
 import json
+import sys
 import uuid
 from pathlib import Path
 
-CATALOG = "vio_travel"
+# Genie data sources are full names and the bundle does not template this file; run with the catalog of the
+# target (python3 genie/build_genie_space.py vio_travel_dev) before deploying a target other than prod.
+CATALOG = sys.argv[1] if len(sys.argv) > 1 else "vio_travel"
 NS = uuid.UUID("6f1c2d4e-0000-4000-8000-000000000001")
 TABLES = {
     "gold.obt_booking_service": "One service of a booking with every attribute; use for supplier, destination, "

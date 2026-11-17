@@ -13,10 +13,10 @@ GRANT USE CATALOG, USE SCHEMA, CREATE SCHEMA, CREATE TABLE, CREATE MATERIALIZED 
       MODIFY, READ VOLUME, WRITE VOLUME, EXECUTE
   ON CATALOG vio_travel TO `82205f93-7db0-4ca5-9d78-63bd916ac9db`;
 
--- People who run the platform (group vio_operators) read every layer and write ops (local/push_to_bc.py writes
--- ops.bc_sync). Personal columns stay masked for them unless they are also in vio_pii_readers.
-GRANT USE CATALOG, USE SCHEMA, SELECT, READ VOLUME, EXECUTE ON CATALOG vio_travel TO `vio_operators`;
-GRANT MODIFY ON SCHEMA vio_travel.ops TO `vio_operators`;
+-- Unity Catalog grants go to account-level principals only; groups created in the workspace (such as
+-- vio_pii_readers) work in is_member() of the mask, not in GRANT. Every workspace user reads gold, masked.
+GRANT USE CATALOG ON CATALOG vio_travel TO `account users`;
+GRANT USE SCHEMA, SELECT ON SCHEMA vio_travel.gold TO `account users`;
 
 -- The masking function must exist before the first pipeline update (the silver and gold schemas use it);
 -- the job vio_travel_governance replaces it with the same definition.

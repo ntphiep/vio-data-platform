@@ -30,6 +30,42 @@ SERVICE_ARRAYS = [
 SCHEMA = "business_central"
 TABLES = ["customers", "vendors", "sales_invoices", "sales_lines", "purchase_invoices", "purchase_lines"]
 PII_TABLES = ["customers", "vendors"]
+# Type code in purchase_key and vendor_invoice_number: Travel Compositor service IDs are unique only inside one
+# service type. Codes of synced documents must not change (the push would treat the old key as removed), so
+# every manual type keeps the code of the former rule 'M' || upper(left(type, 2)), except manual_transport, which
+# shared MTR with manual_transfer and now takes MTP, after TP of transportservice.
+TYPE_CODES = {
+    "hotelservice": "H",
+    "transferservice": "TF",
+    "transportservice": "TP",
+    "ticketservice": "TK",
+    "closedtourservice": "CT",
+    "carservice": "CR",
+    "insuranceservice": "IN",
+    "cruiseservice": "CU",
+    "itemservice": "IT",
+    "manual_hotel": "MHO",
+    "manual_transfer": "MTR",
+    "manual_transport": "MTP",
+    "manual_ticket": "MTI",
+    "manual_closedTour": "MCL",
+    "manual_carRental": "MCA",
+    "manual_cruise": "MCR",
+    "manual_insurance": "MIN",
+    "manual_other": "MOT",
+    "manual_accountingAdjustment": "MAC",
+}
+# Vendor number of an API service without supplier ID: the provider code upper-cased before non-alphanumeric
+# characters are removed, so lowercase letters are kept (Business Central Code fields are upper case). Two
+# providers that still map to one number make blocking check bc_party_number_unique fail; ref.vendor_map
+# (source_kind PROVIDER) then gives one of them its own number.
+PROVIDER_VENDOR_NUMBER = "left('PV' || regexp_replace(upper(s.provider), '[^A-Z0-9]', ''), 20)"
+
+
+def type_code_sql(col: str = "service_type") -> str:
+    """CASE expression for TYPE_CODES; an unknown manual type falls back to the former rule."""
+    whens = " ".join(f"WHEN '{k}' THEN '{v}'" for k, v in TYPE_CODES.items())
+    return f"CASE {col} {whens} ELSE 'M' || upper(left(replace({col}, 'manual_', ''), 2)) END"
 
 
 def silver_token(sql, c: str) -> str:
@@ -164,7 +200,7 @@ def main():
                  AS doc_action,
                CASE WHEN s.supplier_id IS NOT NULL THEN 'SP' || s.supplier_id
                     WHEN NOT s.is_manual AND s.provider IS NOT NULL
-                      THEN coalesce(mp.bc_vendor_no, left('PV' || regexp_replace(s.provider, '[^A-Z0-9]', ''), 20))
+                      THEN coalesce(mp.bc_vendor_no, {PROVIDER_VENDOR_NUMBER})
                     ELSE mm.bc_vendor_no END AS vendor_number,
                CASE WHEN s.supplier_id IS NULL AND (s.is_manual OR s.provider IS NULL) AND mm.bc_vendor_no IS NULL
                     THEN 'VENDOR_UNMAPPED'
@@ -187,11 +223,7 @@ def main():
                sha2(CASE WHEN doc_action = 'CANCEL' THEN 'CANCEL ' ELSE '' END ||
                     to_json(named_struct('v', vendor_number, 'c', cost_currency, 'a', cost_amount,
                                          'd', to_date(booking_created_at))), 256) AS payload_hash
-        FROM (SELECT *, CASE service_type WHEN 'hotelservice' THEN 'H' WHEN 'transferservice' THEN 'TF'
-                 WHEN 'transportservice' THEN 'TP' WHEN 'ticketservice' THEN 'TK' WHEN 'closedtourservice' THEN 'CT'
-                 WHEN 'carservice' THEN 'CR' WHEN 'insuranceservice' THEN 'IN' WHEN 'cruiseservice' THEN 'CU'
-                 WHEN 'itemservice' THEN 'IT'
-                 ELSE 'M' || upper(left(replace(service_type, 'manual_', ''), 2)) END AS type_code FROM service_vendor)""")
+        FROM (SELECT *, {type_code_sql()} AS type_code FROM service_vendor)""")
     sql(f"""CREATE OR REPLACE TABLE {b}.purchase_lines AS
         SELECT purchase_key, booking_ref, 1 AS line_no,
                left(service_type || ' - ' || coalesce(supplier_name, provider, ''), 100) AS description,

@@ -223,6 +223,20 @@ def main():
             "warn",
             f"SELECT booking_ref AS k FROM {g}.fact_pending_payment WHERE days_overdue > 90",
         ),
+        # bookings are read by update date, so a payment can point at a booking that was never in a read window
+        "gold_pending_payment_booking_not_loaded": (
+            "warn",
+            f"""SELECT p.booking_ref AS k FROM {g}.fact_pending_payment p
+            LEFT ANTI JOIN {g}.fact_booking b ON b.booking_ref = p.booking_ref""",
+        ),
+        # the booking and service price breakdowns of Travel Compositor do not always add up (cross-currency costs)
+        "gold_booking_total_differs_from_services": (
+            "warn",
+            f"""SELECT b.booking_ref AS k FROM {g}.fact_booking b
+            JOIN (SELECT booking_ref, sum(sale_amount) AS sale FROM {g}.fact_booking_service GROUP BY 1) s
+              ON s.booking_ref = b.booking_ref
+            WHERE b.is_active AND abs(b.total_price - s.sale) > 0.01""",
+        ),
         # stage 4: business_central -> Business Central. Documents wait while the push has not run for too long.
         "e2e_push_stalled": (
             "alert",

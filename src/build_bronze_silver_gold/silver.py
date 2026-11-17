@@ -685,18 +685,21 @@ def snapshot_entity(
     def next_snapshot(latest_version):
         """(DataFrame, version) of the next complete snapshot after latest_version, or None when there is none.
 
-        The version is the finished_at of the extract run (TIMESTAMP, the type of __START_AT and __END_AT). Only
+        The version is the finished_at of the extract run cut to whole seconds (TIMESTAMP, the type of __START_AT
+        and __END_AT). The pipeline stores the returned version with less than microsecond precision, so a version
+        with microseconds would compare greater than its own stored copy and the same snapshot would be applied
+        again on every call. Extract runs are minutes apart, so whole seconds keep them distinct. Only
         complete reads count: a PARTIAL or FAILED read would close rows that still exist. Without a stored version
         (first update, or a flow reset) only the newest snapshot is applied: the history already holds the older
         ones, and replaying them would version every row again.
         """
         runs = spark.sql(f"""
-            SELECT run_id, max(finished_at) AS version FROM {C}.ops.ingest_runs
+            SELECT run_id, date_trunc('SECOND', max(finished_at)) AS version FROM {C}.ops.ingest_runs
             WHERE entity = '{entity}' AND status = 'SUCCESS' GROUP BY run_id""")
         if latest_version is None:
             run = runs.orderBy(F.col("version").desc()).first()
         else:
-            run = runs.where(F.col("version") > F.lit(latest_version)).orderBy("version").first()
+            run = runs.where(F.col("version") > F.date_trunc("second", F.lit(latest_version))).orderBy("version").first()
         if run is None:
             if latest_version is not None:
                 return None

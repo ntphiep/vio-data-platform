@@ -699,7 +699,9 @@ def snapshot_entity(
         if latest_version is None:
             run = runs.orderBy(F.col("version").desc()).first()
         else:
-            run = runs.where(F.col("version") > F.date_trunc("second", F.lit(latest_version))).orderBy("version").first()
+            run = (
+                runs.where(F.col("version") > F.date_trunc("second", F.lit(latest_version))).orderBy("version").first()
+            )
         if run is None:
             if latest_version is not None:
                 return None

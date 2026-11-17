@@ -184,6 +184,24 @@ def test_exchange_rate_missing_at_source_uses_fallback(monkeypatch):
     assert "<ExchangeRateAmount>1.468000</ExchangeRateAmount>" in seen[0][3]
 
 
+def test_fx_get_retries_timeouts_and_5xx_but_not_404(monkeypatch):
+    answers = [m.requests.Timeout("slow"), Resp(522), Resp(200, {"rates": {"USD": 0.65}})]
+
+    def get(url, params, timeout):
+        a = answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+    monkeypatch.setattr(m.requests, "get", get)
+    sleeps = []
+    assert m.fx_get("https://fx.example/2026-11-09", {}, sleep=sleeps.append).status_code == 200
+    assert len(sleeps) == 2
+    monkeypatch.setattr(m.requests, "get", lambda url, params, timeout: Resp(404))
+    assert m.fx_get("https://fx.example/2026-11-09", {}, sleep=sleeps.append).status_code == 404
+    assert len(sleeps) == 2
+
+
 def test_tc_implied_rate_converts_the_usd_median_to_lcy(monkeypatch):
     class FakeDB:
         def __init__(self):
@@ -241,6 +259,9 @@ def test_retry_option_resends_a_terminal_or_dead_result():
     assert m.doc_decision(dead, None) == "DEAD"
     assert m.doc_decision(dead, None, frozenset({"FAILED"})) == "SEND"
     assert m.doc_decision(no_rate, "VENDOR_UNMAPPED", frozenset({"NO_EXCHANGE_RATE"})) == "HELD"
+    skipped = doc(log_result="SKIPPED", failures=str(m.MAX_FAILURES))
+    assert m.doc_decision(skipped, None) == "DEAD"
+    assert m.doc_decision(skipped, None, frozenset({"SKIPPED"})) == "SEND"
 
 
 def test_held_row_is_logged_only_when_hash_or_reason_changes():

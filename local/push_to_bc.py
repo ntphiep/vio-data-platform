@@ -141,6 +141,24 @@ def retry_after_seconds(value, attempt, cap=120):
     return min(cap, 2**attempt * 2)
 
 
+def fx_get(url, params, attempts=4, sleep=time.sleep):
+    """GET on the rate source (Frankfurter), retried on timeouts, connection errors, 429 and 5xx (it answered
+    522 and timed out on 17/11). A 404 or another 4xx is returned at once: the caller reads it as no rate."""
+    for attempt in range(attempts):
+        try:
+            r = requests.get(url, params=params, timeout=30)
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == attempts - 1:
+                raise
+            sleep(retry_after_seconds(None, attempt, cap=30))
+            continue
+        if (r.status_code == 429 or r.status_code >= 500) and attempt < attempts - 1:
+            sleep(retry_after_seconds(r.headers.get("Retry-After"), attempt, cap=30))
+            continue
+        return r
+    return r
+
+
 # ------------------------------------------------------------------ Databricks SQL
 class DBX:
     def __init__(self, cfg):
@@ -372,7 +390,7 @@ class BC:
                 }
                 rows, missing = [], []
                 for day in sorted(days[cur] - have):
-                    r = requests.get(f"{self.cfg['fx_source']}/{day}", params={"base": lcy, "symbols": cur}, timeout=30)
+                    r = fx_get(f"{self.cfg['fx_source']}/{day}", {"base": lcy, "symbols": cur})
                     if r.status_code == 404 or (r.ok and cur not in r.json().get("rates", {})):
                         missing.append(day)
                         continue
@@ -474,7 +492,7 @@ def tc_implied_rates(db, cfg, pairs, window_days=30, min_services=3):
         WHERE c.dist <= x.d0 + {int(window_days)}
         GROUP BY ALL HAVING count(*) >= {int(min_services)}""")
     for r in rows:
-        u = requests.get(f"{cfg['fx_source']}/{r['day']}", params={"base": lcy, "symbols": "USD"}, timeout=30)
+        u = fx_get(f"{cfg['fx_source']}/{r['day']}", {"base": lcy, "symbols": "USD"})
         u.raise_for_status()
         usd_per_lcy = Decimal(str(u.json()["rates"]["USD"]))
         out[(r["cur"], r["day"])] = format((Decimal(r["per_usd"]) * usd_per_lcy).quantize(Decimal("0.000001")), "f")
@@ -569,12 +587,12 @@ def process_removals(bc, rows, max_removals, record):
 def doc_decision(row, hold_reason, retry=frozenset()):
     """HELD, HELD_LOGGED, DONE, DEAD or SEND for one document row joined with its sync state (state_sql).
     retry: results (from --retry) whose documents are sent again although their hash did not change, for example
-    NO_EXCHANGE_RATE after a new rate source, or dead-lettered FAILED after the cause was fixed."""
+    NO_EXCHANGE_RATE after a new rate source, or dead-lettered FAILED or SKIPPED after the cause was fixed."""
     h = row["payload_hash"]
     if hold_reason and row["doc_action"] == "UPSERT":
         logged = row.get("log_result") == "HELD" and row.get("log_hash") == h and row.get("log_error") == hold_reason
         return "HELD_LOGGED" if logged else "HELD"
-    if row.get("attempt_result") in retry:
+    if row.get("attempt_result") in retry or row.get("log_result") in retry:
         return "SEND"
     if row.get("attempt_result") in TERMINAL and row.get("attempt_hash") == h:
         return "DONE"

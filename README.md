@@ -114,6 +114,8 @@ maps a provider to another vendor in `ref.vendor_map`.
 | Checks | `ops.dq_results`; the check name starts with the layer it tests (`bronze_`, `silver_`, `gold_`, `bc_`, `e2e_`); block stops the publish of `business_central`, alert fails `data_quality` so the failure e-mail goes out |
 | Consistent reads for the push | write-audit-publish: `bc_tables` records table versions in `ops.publish` only after its blocking checks pass, and `local/push_to_bc.py` reads `VERSION AS OF` those versions |
 | Business Central writes | POST retried only on 429; documents matched by `externalDocumentNumber` and `vendorInvoiceNumber`; 3 failures with the same hash stop retries |
+| Exchange rates | missing rates loaded per currency and day through a RapidStart configuration package; ECB rates from Frankfurter, retried on timeouts, 429 and 5xx; days the ECB does not publish (VND, FJD) use the median Travel Compositor cost rate of at least 3 nearby services, converted to AUD |
+| Leftovers of deleted drafts | deleting a numbered draft leaves a posted invoice with total 0 under the same number; the lookup ignores it, so the live draft is updated instead of reported as `DUPLICATE_IN_BC` |
 | Backfill and replay | job `vio_travel_backfill` (for-each over months, 3 at a time, watermark untouched); a failed or PARTIAL month fails its iteration, and "Repair run" re-runs only those months; job parameter `backfill_from`; a pipeline full refresh rebuilds silver and gold from bronze, which keeps every record; bronze and the snapshot history tables refuse a full refresh (`pipelines.reset.allowed` false) because their history exists only there |
 | Free Edition limits | the metastore holds 500 tables and every pipeline table counts twice (its hidden `__materialization_*` table), so datasets without a reader inside the pipeline are plain views; compute stops for the rest of the day once the daily quota is spent |
 | Retry and SLA | task retries with a minimum interval; pipeline e-mails on update and flow failure; job e-mail on failure and on runs over 30 minutes; SQL alert as dead-man switch |
@@ -176,6 +178,8 @@ databricks data-quality create-monitor --json '{"object_type": "schema", "object
 cd local && uv run --no-project --with databricks-sdk --with requests push_to_bc.py --dry-run
 cp systemd/*.service systemd/*.timer ~/.config/systemd/user/ && systemctl --user daemon-reload
 systemctl --user enable --now vio-push-bc.timer
+# send again the documents whose latest result is SKIPPED or FAILED, although their content did not change
+uv run --no-project --with databricks-sdk --with requests push_to_bc.py --retry SKIPPED,FAILED
 
 # when a Business Central number series runs out (trial My Company: P-INV+ ended at 109999); the line starts
 # in 2015 because documents take their number by posting date

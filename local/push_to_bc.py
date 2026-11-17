@@ -797,8 +797,8 @@ def main():
             record(
                 "fx_rate", f"{cur}/{day}", None, None, "UNAVAILABLE", "no ECB rate and too few services to derive one"
             )
-        for cur, err in sorted(fx_errors.items()):
-            record("fx_rate", cur, None, None, "FAILED", err)
+        for cur, day in sorted(p for p in needs if p[0] in fx_errors):
+            record("fx_rate", f"{cur}/{day}", None, None, "FAILED", fx_errors[cur])
 
         failed_parties = set()
         for kind, rows in (("customer", custs), ("vendor", vends)):

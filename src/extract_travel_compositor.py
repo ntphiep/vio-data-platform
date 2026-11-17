@@ -1,14 +1,16 @@
-"""Task extract_tc - Travel Compositor API -> raw files in the Unity Catalog volume <catalog>.raw.landing.
+"""Task extract_travel_compositor - Travel Compositor API -> raw files in the Unity Catalog volume <catalog>.raw.landing.
 
 Design
 - Read-only GET calls (plus the authenticate POST). Credentials come from the Databricks secret scope `vio-tc`.
 - One registry, ENTITIES, says how each entity is read:
     incremental  bookings, by last-update date (`ufrom`/`uto`, day granularity only) from the watermark in
                  <catalog>.ops.watermark with a 1-day overlap, in windows of --window_days; each finished window
-                 advances the watermark, so a long backfill resumes where it stopped.
+                 advances the watermark, so a scheduled run resumes where the last one stopped. A bounded range
+                 (--backfill_to) never moves the watermark; job vio_travel_backfill_bookings reads long ranges month by
+                 month, and a failed month is read again with "Repair run".
     snapshot     agencies, suppliers, users, travel ideas, pending payments, purchase attempts and the
                  accommodation catalog: every page of the list, at most every `refresh_hours`. The pipeline
-                 vio_travel_lakehouse turns consecutive snapshots into type 2 history and detects deletions, so a
+                 vio_travel_build_bronze_silver_gold turns consecutive snapshots into type 2 history and detects deletions, so a
                  snapshot counts only when it is complete (status SUCCESS in ops.ingest_runs).
     by_id        accommodation datasheets of the hotels that appear on bookings, fetched once and refreshed after
                  --datasheet_refresh_days, at most --datasheet_cap per run.
@@ -67,7 +69,7 @@ class Snapshot:
 
 
 # Entities read by default every run (subject to refresh_hours). `accommodations` (283 pages) is read only when
-# --entities names it, by the weekly job vio_travel_catalog.
+# --entities names it, by the weekly job vio_travel_ingest_accommodation_catalog.
 SNAPSHOTS = {
     "agencies": Snapshot("/agency/{ms}", "agency", ("id",)),
     "suppliers": Snapshot("/suppliers", None, ("id",), page_size=0),
@@ -503,7 +505,7 @@ def main():
     finally:
         flush()
 
-    # A bounded backfill window that is PARTIAL also fails the task: the job vio_travel_backfill is resumed with
+    # A bounded backfill window that is PARTIAL also fails the task: the job vio_travel_backfill_bookings is resumed with
     # "Repair run", which re-runs only the failed for_each iterations. A regular run leaves PARTIAL to the next run
     # (the watermark stays) and to the check e2e_extract_failing_or_stale.
     bad = [s for s in done if s[11] == "FAILED" or (bounded and s[11] == "PARTIAL")]

@@ -39,7 +39,7 @@
       {
         "identifier": "vio_travel.gold.booking_metrics",
         "description": [
-          "Metric view: bookings, revenue, gross margin, cancellation rate."
+          "Metric view: bookings, revenue, gross margin, cancellation rate; dimension Currency."
         ]
       },
       {
@@ -69,7 +69,7 @@
       {
         "identifier": "vio_travel.gold.fact_booking",
         "description": [
-          "One booking. is_active = status BOOKED or RQ. Amounts in the booking currency (USD)."
+          "One booking. is_active = status BOOKED or RQ. Amounts in the booking currency (column currency): USD except a handful of EUR bookings."
         ]
       },
       {
@@ -87,7 +87,7 @@
       {
         "identifier": "vio_travel.gold.fact_pending_payment",
         "description": [
-          "Payments still due; days_overdue > 0 is late; ageing_bucket groups them."
+          "Payments still due, amounts in currency. Overdue when due_date < current_date(); days overdue = datediff(current_date(), due_date). Ageing buckets are in receivable_metrics."
         ]
       },
       {
@@ -105,13 +105,13 @@
       {
         "identifier": "vio_travel.gold.receivable_metrics",
         "description": [
-          "Metric view: amounts due and overdue by agency and ageing bucket."
+          "Metric view: amounts due and overdue as of today by agency and ageing bucket; dimension Currency."
         ]
       },
       {
         "identifier": "vio_travel.gold.service_metrics",
         "description": [
-          "Metric view: services, sale amount, cost and margin by supplier and destination."
+          "Metric view: services, sale amount, cost and margin by supplier and destination, in the booking currency; dimension Currency."
         ]
       }
     ]
@@ -123,7 +123,8 @@
         "content": [
           "Vio Travel is a destination management company; bookings come from Travel Compositor.",
           "Revenue is total_price of active bookings (is_active). Gross margin is total_price minus net_provider.",
-          "Amounts are in the booking currency, USD for almost every booking; do not add amounts of different currencies.",
+          "Amounts are in the currency of their row: USD for every booking except a handful in EUR. Never add amounts of different currencies: group by or filter on the currency column (Currency in the metric views) and show it.",
+          "Days overdue and ageing depend on today: use receivable_metrics, or compute from due_date with current_date().",
           "Prefer the metric views booking_metrics, service_metrics and receivable_metrics with MEASURE() for totals.",
           "Personal columns (names, e-mails, phones) are masked for most readers; do not try to unmask them."
         ]
@@ -136,7 +137,7 @@
           "Revenue and gross margin by month"
         ],
         "sql": [
-          "SELECT `Created month`, MEASURE(Revenue) AS revenue,\n  MEASURE(`Gross margin`) AS gross_margin\nFROM vio_travel.gold.booking_metrics GROUP BY ALL ORDER BY 1"
+          "SELECT `Created month`, Currency, MEASURE(Revenue) AS revenue,\n  MEASURE(`Gross margin`) AS gross_margin\nFROM vio_travel.gold.booking_metrics GROUP BY ALL ORDER BY 1, 2"
         ]
       },
       {
@@ -145,7 +146,7 @@
           "Overdue amount by ageing bucket"
         ],
         "sql": [
-          "SELECT `Ageing bucket`, MEASURE(`Amount to pay`) AS amount_to_pay\nFROM vio_travel.gold.receivable_metrics GROUP BY ALL ORDER BY 1"
+          "SELECT `Ageing bucket`, Currency, MEASURE(`Amount to pay`) AS amount_to_pay\nFROM vio_travel.gold.receivable_metrics GROUP BY ALL ORDER BY 1, 2"
         ]
       }
     ]

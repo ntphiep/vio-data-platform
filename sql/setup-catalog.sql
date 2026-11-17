@@ -2,7 +2,7 @@
 -- A catalog on Default Storage cannot be created through the catalogs REST API in this workspace
 -- ("Metastore storage root URL does not exist"); CREATE CATALOG in SQL uses Default Storage.
 CREATE CATALOG IF NOT EXISTS vio_travel
-  COMMENT 'Vio Travel data platform: Travel Compositor API, Lakeflow pipeline vio_travel_lakehouse, Business Central';
+  COMMENT 'Vio Travel data platform: Travel Compositor API, Lakeflow pipeline vio_travel_build_bronze_silver_gold, Business Central';
 -- Delta maintenance (OPTIMIZE, VACUUM, statistics, liquid clustering keys of CLUSTER BY AUTO) for every managed
 -- table in the catalog.
 ALTER CATALOG vio_travel ENABLE PREDICTIVE OPTIMIZATION;
@@ -19,7 +19,7 @@ GRANT USE CATALOG ON CATALOG vio_travel TO `account users`;
 GRANT USE SCHEMA, SELECT ON SCHEMA vio_travel.gold TO `account users`;
 
 -- The masking function must exist before the first pipeline update (the silver and gold schemas use it);
--- the job vio_travel_governance replaces it with the same definition.
+-- the job vio_travel_apply_governance replaces it with the same definition.
 CREATE SCHEMA IF NOT EXISTS vio_travel.governance COMMENT 'Masking functions and governance helpers';
 CREATE OR REPLACE FUNCTION vio_travel.governance.mask_pii(v STRING)
   RETURNS STRING

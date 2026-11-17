@@ -1,20 +1,20 @@
 resources:
   jobs:
-    vio_travel_pipeline:
-      name: vio_travel_pipeline
+    vio_travel_ingest_transform_publish:
+      name: vio_travel_ingest_transform_publish
       description: >-
-        Travel Compositor API -> volume raw.landing (extract_tc) -> pipeline vio_travel_lakehouse (bronze, silver
+        Travel Compositor API -> volume raw.landing (extract_travel_compositor) -> pipeline vio_travel_build_bronze_silver_gold (bronze, silver
         with history, gold star schema read by the dashboard vio_travel_overview and the Genie space) -> Business
-        Central integration tables in business_central (bc_tables, published only after its blocking checks pass,
-        then pushed by local/push_to_bc.py outside Databricks because it uses a delegated Azure CLI login). The last
-        task, data_quality, records pipeline expectations, gold checks and end-to-end freshness.
+        Central integration tables in business_central (build_business_central_tables, published only after its blocking checks pass,
+        then pushed by local/push_to_business_central.py outside Databricks because it uses a delegated Azure CLI login). The last
+        task, check_data_quality, records pipeline expectations, gold checks and end-to-end freshness.
       max_concurrent_runs: 1
       run_as:
         service_principal_name: ${var.pipeline_sp}
       timeout_seconds: 7200
       queue: {enabled: true}
       schedule:
-        # every 30 minutes, at minute 05 and 35; the pipeline refreshes only what changed and bc_tables skips the
+        # every 30 minutes, at minute 05 and 35; the pipeline refreshes only what changed and build_business_central_tables skips the
         # rebuild when silver did not change, so night runs stay short (Free Edition has a daily compute quota)
         quartz_cron_expression: "0 5/30 * * * ?"
         timezone_id: Asia/Ho_Chi_Minh
@@ -29,7 +29,7 @@ resources:
         on_duration_warning_threshold_exceeded: [ "${workspace.current_user.userName}" ]
       tags:
         project: vio_travel
-        contains_pii: "true"
+        data_classification: personal_data
       parameters:
         - name: backfill_from
           default: ""
@@ -42,35 +42,35 @@ resources:
             dependencies:
               - requests
       tasks:
-        - task_key: extract_tc
+        - task_key: extract_travel_compositor
           environment_key: default
           max_retries: 2
           min_retry_interval_millis: 300000
           spark_python_task:
-            python_file: ../src/ingest_tc.py
+            python_file: ../src/extract_travel_compositor.py
             parameters: ["--catalog", "${var.catalog}", "--backfill_from", "{{job.parameters.backfill_from}}"]
-        - task_key: lakehouse
+        - task_key: build_bronze_silver_gold
           depends_on:
-            - task_key: extract_tc
+            - task_key: extract_travel_compositor
           # no task retry: the pipeline retries the update itself (pipelines.numUpdateRetryAttempts)
           max_retries: 0
           pipeline_task:
-            pipeline_id: ${resources.pipelines.vio_travel_lakehouse.id}
+            pipeline_id: ${resources.pipelines.vio_travel_build_bronze_silver_gold.id}
             full_refresh: false
-        - task_key: bc_tables
+        - task_key: build_business_central_tables
           depends_on:
-            - task_key: lakehouse
+            - task_key: build_bronze_silver_gold
           environment_key: default
           max_retries: 1
           spark_python_task:
-            python_file: ../src/bc_tables.py
+            python_file: ../src/build_business_central_tables.py
             parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}",
                          "--rebuild", "{{job.parameters.rebuild}}"]
-        - task_key: data_quality
+        - task_key: check_data_quality
           depends_on:
-            - task_key: bc_tables
+            - task_key: build_business_central_tables
           run_if: ALL_DONE          # also after a failed task, so the end-to-end state is always recorded
           environment_key: default
           spark_python_task:
-            python_file: ../src/data_quality.py
+            python_file: ../src/check_data_quality.py
             parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}"]

@@ -1,0 +1,56 @@
+resources:
+  jobs:
+    # Re-extract a long date range in parallel, month by month, without moving the watermark of the regular job.
+    # The job only lands files: the next run of vio_travel_ingest_transform_publish loads them through the pipeline, so the two
+    # jobs never start the pipeline or rebuild business_central at the same time. AUTO CDC orders versions by
+    # lastUpdateDate, so the order in which the windows land does not matter.
+    vio_travel_backfill_bookings:
+      name: vio_travel_backfill_bookings
+      description: >-
+        Backfill of bookings: plan_backfill_windows splits [backfill_from, backfill_to] into calendar months, extract_booking_windows
+        runs extract_travel_compositor for each month (for-each task, 3 at a time). The next scheduled run of vio_travel_ingest_transform_publish
+        loads the landed files.
+      max_concurrent_runs: 1
+      timeout_seconds: 21600
+      run_as:
+        service_principal_name: ${var.pipeline_sp}
+      email_notifications:
+        on_failure: [ "${workspace.current_user.userName}" ]
+      tags:
+        project: vio_travel
+        data_classification: personal_data
+      parameters:
+        - name: backfill_from
+          default: "2015-01-01"
+        - name: backfill_to
+          default: ""
+        - name: months
+          default: "1"
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - requests
+      tasks:
+        - task_key: plan_backfill_windows
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/plan_backfill_windows.py
+            parameters: ["--backfill_from", "{{job.parameters.backfill_from}}",
+                         "--backfill_to", "{{job.parameters.backfill_to}}", "--months", "{{job.parameters.months}}"]
+        - task_key: extract_booking_windows
+          depends_on:
+            - task_key: plan_backfill_windows
+          for_each_task:
+            inputs: "{{tasks.plan_backfill_windows.values.windows}}"
+            concurrency: 3        # Free Edition runs at most 5 tasks at once
+            task:
+              task_key: extract_booking_window
+              environment_key: default
+              max_retries: 2
+              min_retry_interval_millis: 120000
+              spark_python_task:
+                python_file: ../src/extract_travel_compositor.py
+                parameters: ["--catalog", "${var.catalog}", "--entities", "bookings",
+                             "--backfill_from", "{{input.from}}", "--backfill_to", "{{input.to}}"]

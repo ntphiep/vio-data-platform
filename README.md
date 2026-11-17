@@ -1,198 +1,369 @@
 # vio-data-platform
 
-Data platform for Vio Travel on Databricks. It pulls bookings, agencies, suppliers, users, travel ideas, payments
-due, purchase attempts and accommodations from the Travel Compositor API (Vio's booking platform, operator `easia`),
-keeps them in the Unity Catalog catalog `vio_travel` with their history, models them as a star schema with metric
-views for reporting and Genie, shapes them for the Business Central API, and shows them in an AI/BI dashboard.
+Lakehouse on Databricks for Vio Travel, a destination management company whose bookings live in Travel Compositor
+(operator `easia`). The platform reads the Travel Compositor REST API, keeps every record and its history in the Unity
+Catalog catalog `vio_travel`, models it as a star schema for an AI/BI dashboard and a Genie space, and turns bookings
+into sales and purchase invoices in Microsoft Dynamics 365 Business Central.
 
-Research notes, field mapping and measurements live outside this repo, in `~/W/viotravel/vio_docs/`
-(Vietnamese, starts at `README.md`).
+It is a lab: it runs in a Databricks Free Edition workspace and writes into the company `My Company` of a Business
+Central trial. The Travel Compositor API is only read (GET, plus the authenticate POST).
 
-## Flow
+![Data flow](docs/data-flow.png)
 
-| Step | Code | Reads | Writes |
+## Contents
+
+- [Architecture](#architecture)
+- [Unity Catalog layout](#unity-catalog-layout)
+- [Ingestion](#ingestion)
+- [Transformation](#transformation)
+- [Data model](#data-model)
+- [Business Central integration](#business-central-integration)
+- [Orchestration](#orchestration)
+- [Data quality](#data-quality)
+- [Monitoring and freshness](#monitoring-and-freshness)
+- [Performance and cost](#performance-and-cost)
+- [Governance and security](#governance-and-security)
+- [Conventions](#conventions)
+- [Development](#development)
+- [Operations](#operations)
+- [Limitations](#limitations)
+
+## Architecture
+
+| Stage | Runs as | Code | Output |
 |---|---|---|---|
-| `extract_tc` | `src/ingest_tc.py` | Travel Compositor API, GET only | volume `raw.landing`, gzip NDJSON, one file per page |
-| `lakehouse` | pipeline `vio_travel_lakehouse`, `src/lakehouse/` | `raw.landing`, `ops.ingest_runs`, `ref.umbrella_agency` | `bronze.tc_*`, `silver.*`, `gold.*`, event log `ops.pipeline_event_log` |
-| `bc_tables` | `src/bc_tables.py` | `silver.*`, `ref.*` | `business_central.*`, then a row in `ops.publish` |
-| `data_quality` | `src/data_quality.py` | event log, `gold.*`, `ops.*` | `ops.dq_results`: expectations, `gold_` and `e2e_` checks |
-| dashboard | `dashboards/vio_travel_overview.lvdash.json` | `gold.*`, `business_central.*`, `ops.*` | AI/BI dashboard Vio Travel overview, 5 pages |
-| Genie | `genie/vio_travel_genie.geniespace.json` | `gold.*`, metric views | Genie space Vio Travel Genie |
-| push | `local/push_to_bc.py` | `business_central.*` at the published versions | Business Central, company My Company; `ops.bc_sync` |
-| alert | `resources/pipeline_freshness.alert.yml` | `ops.dq_results` | e-mail when no end-to-end check arrived for 75 minutes |
+| Extract | task `extract_travel_compositor` of job `vio_travel_ingest_transform_publish` | `src/extract_travel_compositor.py` | gzip NDJSON files in volume `raw.landing`, run log in `ops` |
+| Bronze, silver, gold | Lakeflow pipeline `vio_travel_build_bronze_silver_gold`, task `build_bronze_silver_gold` | `src/build_bronze_silver_gold/bronze.py`, `silver.py`, `gold.py` | schemas `bronze`, `silver`, `gold` |
+| Integration tables | task `build_business_central_tables` | `src/build_business_central_tables.py` | schema `business_central`, published version in `ops.publish` |
+| Checks | task `check_data_quality` | `src/check_data_quality.py` | `ops.dq_results` |
+| Push | systemd timer `vio-push-business-central.timer` on a workstation | `local/push_to_business_central.py` | Business Central draft invoices, `ops.business_central_sync` |
+| Serving | AI/BI dashboard `Vio Travel overview`, Genie space `Vio Travel Genie`, 3 metric views | `dashboards/`, `genie/`, `src/apply_governance.py` | |
 
-The four steps above the dashboard run in the job `vio_travel_pipeline` every 30 minutes, at minute 05 and 35
-(Asia/Ho_Chi_Minh), as the service principal `vio-travel-pipeline`. Three more jobs: `vio_travel_catalog` reads the
-accommodation catalog weekly, `vio_travel_backfill` re-extracts a date range month by month, and
-`vio_travel_governance` applies tags, masks, grants and the metric views. The push into Business Central runs on a
-local machine because it uses a delegated Azure CLI login, which a job cannot do; its systemd timer asks the Jobs
-API every 5 minutes and pushes after each finished job run.
+The design is ELT: API responses are landed unchanged, and every transformation runs inside Databricks, so a parsing
+bug is fixed by replaying landed files, not by calling the API again.
 
-## Entities
-
-| Entity | Endpoint | How it is read | Silver |
-|---|---|---|---|
-| bookings | `/booking/getBookings` | incremental by update date, 7-day windows, every run | `bookings` (SCD 1), `bookings_history` (SCD 2), `booking_services`, `booking_payments`, `booking_invoices`, `booking_price_components` |
-| agencies | `/agency/{microsite}` | snapshot, every 6 hours | `agencies`, `agencies_history` |
-| suppliers | `/suppliers` | snapshot, every 6 hours | `suppliers`, `suppliers_history` |
-| users | `/user/{microsite}` | snapshot, every 6 hours | `users`, `users_history` |
-| travel ideas | `/travelidea/{microsite}` | snapshot, every 6 hours | `travel_ideas`, `travel_ideas_history` |
-| pending payments | `/pending-payments/{microsite}` | snapshot, every run | `pending_payments`, `pending_payments_history` |
-| purchase attempts | `/purchase-attempts/{microsite}` | snapshot, every run | `purchase_attempts`, `purchase_attempts_history` |
-| accommodations | `/accommodations` | snapshot of 283 pages, weekly, 4 parallel requests | `accommodations`, `accommodations_history` |
-| accommodation datasheets | `/accommodations/{id}/datasheet` | booked hotels only, 200 per run, refreshed after 30 days | `accommodation_details` (SCD 1) |
-
-`/microsites/{microsite}/manual-exchange-rates` answers 401 for Vio's API user, so it is not read. Contracts are
-not read either; finance data comes from the pending payments, purchase attempts and the payment, invoice and
-price breakdown blocks of each booking.
-
-## Freshness
-
-| Stage | Up to date within | Watched by |
-|---|---|---|
-| Travel Compositor API to bronze and silver | 30 minutes plus the run time | `e2e_extract_failing_or_stale` per entity, `e2e_pipeline_failed_or_stale` |
-| silver to gold, the dashboard and Genie | same pipeline update | pipeline expectations, `gold_` checks |
-| silver to `business_central` | same run | `e2e_business_central_behind_silver` |
-| `business_central` to Business Central | 5 minutes after the run, 100 bookings per push | `e2e_push_stalled`, `e2e_sales_waiting_for_push` |
-| the job itself | | SQL alert `pipeline_freshness`; anomaly detection of Unity Catalog on schemas `silver`, `gold`, `business_central` |
-
-The Travel Compositor API filters bookings by update date only to the day (`ufrom`), so a run re-reads today and
-yesterday. Webhooks would need a URL registered on Vio's Travel Compositor account, which is out of scope.
-
-## Layers in catalog `vio_travel`
-
-| Schema | Layer | What it holds |
-|---|---|---|
-| `raw` | landing | volume `landing`: API responses as returned, one folder per entity |
-| `bronze` | raw history | `tc_<entity>`, one VARIANT row per landed record, append-only, never reset by a full refresh |
-| `silver` | current state and history | see Entities; `*_history` tables are SCD type 2 with `__START_AT`, `__END_AT`; `booking_invoices`, `booking_price_components` and `accommodations` are plain views created by job `vio_travel_governance` |
-| `gold` | analytics model | star schema, one big table and metric views, below |
-| `business_central` | integration output | `customers`, `vendors`, `sales_invoices`, `sales_lines`, `purchase_invoices`, `purchase_lines` |
-| `ref` | mappings | `umbrella_agency`, `customer_map`, `vendor_map`, maintained by Vio Finance |
-| `governance` | governance | function `mask_pii` |
-| `ops` | operations | `api_calls`, `ingest_runs`, `watermark`, `accommodation_fetch`, `pipeline_event_log`, `build_state`, `dq_results`, `publish`, `bc_sync` |
-
-## Data model (schema `gold`)
-
-Kimball star schema. Dimensions are type 1 (current values) with key `-1` for Unknown; `dim_agency_history`
-gives the type 2 view for as-of questions. Every table is a materialized view of the pipeline with liquid
-clustering and informational primary and foreign keys (`RELY`).
-
-| Table | Grain | Keys and main columns |
-|---|---|---|
-| `dim_date` | one calendar day, 2015 to 2030 | `date_key` (yyyyMMdd), year, quarter, month, `year_month`, week, weekday |
-| `dim_agency`, `dim_agency_history` | one agency, one agency version | `agency_key` (Travel Compositor agency ID), name, country, deferred terms, `is_umbrella` |
-| `dim_supplier` | one supplier | `supplier_key`: `SP<id>` Travel Compositor supplier, `PV<code>` provider, `MN:<name>` manual service |
-| `dim_service_type` | one service type | `service_type` (`hotelservice`, `manual_hotel`, ...), `service_category`, `is_manual` |
-| `dim_user` | one microsite user | `user_key` (SHA-256 of `<agency ID>:<username>`, as usernames are often e-mail addresses), masked name and e-mail, profile, `b2c` |
-| `dim_travel_idea` | one travel idea | `idea_key` (idea ID), title, trip type, price per person, destinations |
-| `dim_accommodation` | one booked hotel | `accommodation_key` (`hotelId`), category, chain, destination, rating on a 10 scale |
-| `fact_booking` | one booking, current state | keys to agency, user, idea, dates; status, trip type; `total_price`, `net_provider`, `gross_margin`, `pending_amount`, pax |
-| `fact_booking_service` | one service of a booking | keys to booking, supplier, agency, service type, accommodation; sale and cost amounts |
-| `fact_booking_payment` | one payment on a booking | first, second, additional or manual payment; amount, payment system |
-| `fact_pending_payment` | one payment due | amount to pay, due date, `days_overdue`, `ageing_bucket` |
-| `fact_booking_status_change` | one tracked change | previous and new status, amount change, from `silver.bookings_history` |
-| `fact_purchase_attempt` | one checkout started | amount, trip type, `is_converted` when a booking carries the same idea ID |
-| `obt_booking_service` | one service of a booking | `fact_booking_service` joined with every dimension, for ad-hoc SQL and Genie |
-| `booking_metrics`, `service_metrics`, `receivable_metrics` | metric views | revenue, margin, cancellation rate; services by supplier; amounts due and overdue |
-
-`SP` and `PV` keys of `supplier_key` equal the vendor numbers in `business_central.vendors`, unless Vio Finance
-maps a provider to another vendor in `ref.vendor_map`.
-
-## Reliability, performance and data quality
-
-| Concern | How |
-|---|---|
-| API errors | up to 6 attempts on 429, 5xx, network errors and truncated JSON, full-jitter backoff capped at 120 s, `Retry-After` honoured, token renewed 5 minutes before expiry and shared by parallel readers |
-| Missed records | distinct keys compared with `totalResults` for every booking window and snapshot; a short booking window is read again, then PARTIAL and the watermark does not move; a short snapshot is never applied |
-| Exactly-once load | Auto Loader in the pipeline tracks every landed file; files are written as `.tmp` then renamed |
-| Out-of-order updates | AUTO CDC orders booking versions by `lastUpdateDate`, then load time, so a replayed page never overwrites a newer version |
-| History (SCD) | SCD type 2 by AUTO CDC FROM SNAPSHOT for the snapshot entities, which also closes keys that disappear (a paid pending payment); SCD type 2 of booking status and amounts; SCD type 1 for current state |
-| Incremental transform | streaming tables process only new bronze rows; materialized views refresh incrementally on serverless when the plan allows; the 283,000-row accommodation catalog applies only changed rows |
-| Layout | liquid clustering (`CLUSTER BY` on join keys, `CLUSTER BY AUTO` elsewhere) instead of partitions and Z-ORDER; deletion vectors, row tracking and change data feed on silver; predictive optimization on the catalog |
-| Expectations | every layer; rows without a key are dropped, other rules warn; results copied from the event log into `ops.dq_results` |
-| Checks | `ops.dq_results`; the check name starts with the layer it tests (`bronze_`, `silver_`, `gold_`, `bc_`, `e2e_`); block stops the publish of `business_central`, alert fails `data_quality` so the failure e-mail goes out |
-| Consistent reads for the push | write-audit-publish: `bc_tables` records table versions in `ops.publish` only after its blocking checks pass, and `local/push_to_bc.py` reads `VERSION AS OF` those versions |
-| Business Central writes | POST retried only on 429; documents matched by `externalDocumentNumber` and `vendorInvoiceNumber`; 3 failures with the same hash stop retries |
-| Exchange rates | missing rates loaded per currency and day through a RapidStart configuration package; ECB rates from Frankfurter, retried on timeouts, 429 and 5xx; days the ECB does not publish (VND, FJD) use the median Travel Compositor cost rate of at least 3 nearby services, converted to AUD |
-| Leftovers of deleted drafts | deleting a numbered draft leaves a posted invoice with total 0 under the same number; the lookup ignores it, so the live draft is updated instead of reported as `DUPLICATE_IN_BC` |
-| Backfill and replay | job `vio_travel_backfill` (for-each over months, 3 at a time, watermark untouched); a failed or PARTIAL month fails its iteration, and "Repair run" re-runs only those months; job parameter `backfill_from`; a pipeline full refresh rebuilds silver and gold from bronze, which keeps every record; bronze and the snapshot history tables refuse a full refresh (`pipelines.reset.allowed` false) because their history exists only there |
-| Free Edition limits | the metastore holds 500 tables and every pipeline table counts twice (its hidden `__materialization_*` table), so datasets without a reader inside the pipeline are plain views; compute stops for the rest of the day once the daily quota is spent |
-| Retry and SLA | task retries with a minimum interval; pipeline e-mails on update and flow failure; job e-mail on failure and on runs over 30 minutes; SQL alert as dead-man switch |
-
-## Governance
-
-| Control | How |
-|---|---|
-| Identity | jobs and pipeline run as the service principal `vio-travel-pipeline`; the secret scope `vio-tc` is readable only by it and the owner |
-| Column masks | `governance.mask_pii` on e-mail, phone, name and address columns of silver and `dim_user`; values show only to the group `vio_pii_readers` |
-| Tags | table tag `contains_pii`, column tag `pii` (`email`, `phone`, `name`, `address`) |
-| Grants | every workspace user (`account users`) reads `gold`, masked; only the service principal and the catalog owner read `bronze` and `silver` |
-| Lineage and audit | Unity Catalog lineage of the pipeline and jobs; the pipeline event log as a table |
-
-## Repository layout
+Repository layout:
 
 | Path | Content |
 |---|---|
-| `databricks.yml`, `resources/` | Databricks Asset Bundle: schemas, volume, pipeline `vio_travel_lakehouse`, jobs `vio_travel_pipeline`, `vio_travel_backfill`, `vio_travel_catalog`, `vio_travel_governance`, dashboard, Genie space, SQL alert |
-| `src/` | job tasks; `src/lakehouse/` holds the pipeline source, one file per layer |
-| `dashboards/build_dashboard.py` | generates `dashboards/vio_travel_overview.lvdash.json`; edit the script, not the JSON |
-| `genie/build_genie_space.py` | generates `genie/vio_travel_genie.geniespace.json`; edit the script, not the JSON |
-| `local/` | `push_to_bc.py`, `config.json`, systemd units for the push after each job run, `extend_number_series.py` for a Business Central number series that ran out |
-| `sql/` | one-time SQL: `setup-catalog.sql`, `migrate-to-lakehouse.sql`, `ref-maps-lab-seed.sql` |
-| `tests/` | unit tests for the API client, the snapshot and datasheet readers, the backfill planner and the Business Central client |
-| `pyproject.toml`, `.github/workflows/ci.yml` | ruff rules; CI runs ruff, the tests, checks that the dashboard and Genie JSON match their generators, and `databricks bundle validate` when the repository secrets `DATABRICKS_HOST` and `DATABRICKS_TOKEN` exist |
+| `databricks.yml`, `resources/` | Databricks Asset Bundle: schemas, volume, pipeline, 4 jobs, dashboard, Genie space, SQL alert |
+| `src/` | job tasks; `src/build_bronze_silver_gold/` is the pipeline source, one file per layer |
+| `dashboards/build_dashboard.py`, `genie/build_genie_space.py` | generators of the dashboard and Genie JSON; edit the script, never the JSON |
+| `local/` | the Business Central push, its config, systemd units, `extend_number_series.py` |
+| `sql/` | one-time setup: `setup-catalog.sql` (catalog, grants, masking function, `ref` tables), `ref-maps-lab-seed.sql` (lab-only mappings, never in production) |
+| `tests/` | unit tests of the API client, readers, backfill planner, push logic and shared SQL fragments |
+| `docs/` | `data-flow.drawio` and `star-schema.drawio` with their PNG exports |
+| `.github/workflows/ci.yml`, `.githooks/pre-push` | the same checks in GitHub Actions and before every local push |
 
-## Run
+## Unity Catalog layout
+
+One catalog per environment: `vio_travel` (target `prod`) and `vio_travel_dev` (target `dev`). Schemas follow the
+medallion layers plus integration, reference and operations schemas.
+
+| Schema | Holds | Written by | Readers |
+|---|---|---|---|
+| `raw` | volume `landing`: one folder per entity, ingest date and run; files kept 90 days | `extract_travel_compositor` | pipeline |
+| `bronze` | `tc_<entity>`: one VARIANT row per landed record, append-only, full history | pipeline (Auto Loader) | pipeline |
+| `silver` | current state per entity and `<entity>_history` (SCD type 2); typed columns, personal data masked | pipeline | `build_business_central_tables`, analysts with grant |
+| `gold` | star schema `dim_*`, `fact_*`, one big table `obt_booking_service`, metric views `*_metrics` | pipeline, `vio_travel_apply_governance` | every workspace user, masked |
+| `business_central` | `customers`, `vendors`, `sales_invoices`, `sales_lines`, `purchase_invoices`, `purchase_lines` in the shape of the Business Central API v2.0 | `build_business_central_tables` | `local/push_to_business_central.py` |
+| `ref` | `umbrella_agency`, `customer_map`, `vendor_map`: mappings owned by Vio Finance | Finance, through SQL | `build_business_central_tables`, pipeline |
+| `governance` | function `mask_pii` | `vio_travel_apply_governance` | column masks |
+| `ops` | `api_calls`, `ingest_runs`, `watermark`, `accommodation_fetch`, `pipeline_event_log`, `build_state`, `dq_results`, `publish`, `business_central_sync` | every task and the push | dashboard page Pipeline operations, alert |
+
+Schemas, the volume and the pipeline event log are bundle resources (`resources/schemas.yml`); schemas that hold
+history have `prevent_destroy`. The catalog itself is created once by `sql/setup-catalog.sql`, because a catalog on
+Default Storage cannot be created through the catalogs API.
+
+## Ingestion
+
+`src/extract_travel_compositor.py` declares every entity in one registry and reads it in one of three ways:
+
+| Mode | Entities | Strategy |
+|---|---|---|
+| incremental | bookings (`/booking/getBookings`) | by last-update date from the watermark in `ops.watermark`, 1-day overlap, 7-day windows; the API filters by day only, so each run reads today and yesterday again |
+| snapshot | agencies, suppliers, users, travel ideas (every 6 hours); pending payments, purchase attempts (every run); accommodation catalog, 283 pages (weekly, job `vio_travel_ingest_accommodation_catalog`, 4 parallel requests) | every page of the list; the pipeline compares consecutive snapshots |
+| by id | accommodation datasheets of booked hotels | 200 per run, refreshed after 30 days |
+
+Reliability of the extract:
+
+- Retries with exponential backoff and full jitter on 429, 5xx, network errors and truncated JSON, up to 6 attempts,
+  capped at 120 seconds, honouring `Retry-After`. The token is renewed 5 minutes before expiry and shared by
+  parallel readers.
+- Completeness: the distinct keys landed are compared with `totalResults` for every window and snapshot. A short
+  booking window is read again and then recorded as `PARTIAL`, and the watermark stays. A short or empty snapshot is
+  never applied, because the pipeline would close every key missing from it.
+- Atomic files: each API page is written as `.tmp` and renamed, so Auto Loader never reads a half-written file.
+- Every HTTP attempt is logged in `ops.api_calls`, every window and snapshot in `ops.ingest_runs`.
+
+Webhooks are not used: they need a URL registered on Vio's Travel Compositor account, which is a write to the
+customer's system. Contracts and `/manual-exchange-rates` (401 for Vio's API user) are not read.
+
+## Transformation
+
+The Lakeflow Spark Declarative Pipeline `vio_travel_build_bronze_silver_gold` (serverless, triggered, channel `CURRENT`) builds all
+three layers. Its event log is the table `ops.pipeline_event_log`.
+
+| Layer | Technique |
+|---|---|
+| bronze | Auto Loader (`cloudFiles`) streaming tables, one per entity, VARIANT payload plus file and run metadata; exactly-once by file; `pipelines.reset.allowed = false`, so a full refresh never empties them |
+| silver, bookings | `AUTO CDC` keyed on `booking_ref`, sequenced by `lastUpdateDate` then load time: SCD type 1 in `bookings` and SCD type 2 of status and amounts in `bookings_history`; late or replayed versions never overwrite newer ones |
+| silver, snapshots | `AUTO CDC FROM SNAPSHOT` per entity: SCD type 2 in `<entity>_history`, which also closes keys that disappear (a paid pending payment), and the current rows in `<entity>` |
+| silver, children | materialized views exploding the booking payload: `booking_services` (one row per service, all service arrays), `booking_payments`; `booking_invoices`, `booking_price_components` and `accommodations` are plain views to save table quota |
+| gold | materialized views, refreshed incrementally on serverless when the query plan allows |
+
+Incremental processing end to end: the extract reads only changed bookings, Auto Loader picks up only new files, the
+streaming tables process only new bronze rows, and `build_business_central_tables` skips its rebuild when the silver tables did not change
+since the last publish (`ops.build_state`).
+
+A pipeline full refresh rebuilds silver and gold from bronze; bronze and the snapshot history tables are excluded
+because their history exists only there.
+
+## Data model
+
+![Star schema](docs/star-schema.png)
+
+Kimball star schema in `gold`. Dimensions are SCD type 1 with member `-1` (Unknown) for missing keys;
+`dim_agency_history` gives the type 2 view for as-of questions. Facts and dimensions carry informational primary and
+foreign keys with `RELY`, which the optimizer and Genie use for joins.
+
+| Table | Grain |
+|---|---|
+| `dim_date` | one calendar day, 2015 to 2030, key `date_key` (yyyyMMdd) |
+| `dim_agency`, `dim_agency_history` | one agency; one agency version |
+| `dim_supplier` | one supplier: `SP<id>` Travel Compositor supplier, `PV<code>` provider, `MN:<name>` manual service; `SP` and `PV` keys equal the Business Central vendor numbers |
+| `dim_service_type` | one service type with category |
+| `dim_user` | one microsite user, key SHA-256 of agency and username |
+| `dim_travel_idea` | one travel idea |
+| `dim_accommodation` | one booked hotel |
+| `fact_booking` | one booking, current state |
+| `fact_booking_service` | one service of a booking, sale and cost amounts |
+| `fact_booking_payment` | one payment received on a booking |
+| `fact_pending_payment` | one payment due, with due date; days overdue are computed at query time by `receivable_metrics`, so they never freeze when the pipeline stops |
+| `fact_booking_status_change` | one tracked change of status or amount, from `silver.bookings_history` |
+| `fact_purchase_attempt` | one checkout started, converted or not |
+| `obt_booking_service` | `fact_booking_service` joined with every dimension, for ad-hoc SQL and Genie |
+
+Metric views (`booking_metrics`, `service_metrics`, `receivable_metrics`, YAML 1.1) define revenue, margin,
+cancellation rate, service cost by supplier and amounts due or overdue once, for the dashboard, Genie and SQL users.
+Amounts are in the booking currency and every metric view has a `Currency` dimension: bookings are in USD except a
+few EUR bookings with total 0, so totals are never summed across currencies.
+
+The dashboard `Vio Travel overview` has 5 pages: Bookings and revenue, Suppliers and cost, Payments due, Ideas,
+hotels and checkouts, Pipeline operations. The Genie space answers questions on the gold tables and metric views with
+the asking user's permissions.
+
+## Business Central integration
+
+Business Central is the accounting system (ERP). The integration creates draft documents that Finance reviews and
+posts; it never posts.
+
+| Business Central object | From | Key |
+|---|---|---|
+| customer | Travel Compositor agency, or the customer that `ref.customer_map` assigns to a booking of an umbrella agency | `AG<agency id>` |
+| vendor | Travel Compositor supplier, provider code of an API service, or `ref.vendor_map` for manual services | `SP<id>`, `PV<code>` |
+| sales invoice | one per booking in status BOOKED, RQ or CANCELED; one line per active service | `externalDocumentNumber` = booking reference |
+| purchase invoice | one per service with a cost | `vendorInvoiceNumber` = service id and type code |
+| currency exchange rate | ECB rate (Frankfurter API); for currencies the ECB does not publish (VND, FJD), the median Travel Compositor cost rate of at least 3 nearby services | currency and date |
+
+`build_business_central_tables` shapes these rows, runs its blocking checks, and only then records the Delta versions of the six tables in
+`ops.publish` (write-audit-publish). A document that cannot be sent gets a `hold_reason`, for example
+`CUSTOMER_UNMAPPED` or `VENDOR_UNMAPPED`, and waits for a mapping.
+
+`local/push_to_business_central.py` runs on a workstation because Business Central accepts only a delegated Azure CLI login there
+(no app registration in the tenant). Each run:
+
+1. Asks the Jobs API whether `vio_travel_ingest_transform_publish` finished a run since the last push (timer every 5 minutes).
+2. Reads the six tables `VERSION AS OF` the last published versions, so it sees one consistent, checked build.
+3. Compares each document's `payload_hash` with its last result in `ops.business_central_sync` and selects up to 100 bookings with
+   changes, oldest first.
+4. Upserts customers and vendors, loads missing exchange rates through a RapidStart configuration package.
+5. Creates a draft invoice with its lines in one deep-insert POST, or replaces the header and lines of an
+   existing draft in one transactional `$batch`. A posted document is never changed and is reported as
+   `NEEDS_CREDIT_MEMO`; a cancelled booking empties its draft so it cannot be posted. Drafts are never deleted,
+   because deleting a numbered draft makes Business Central create an empty posted invoice.
+6. Writes one result row per document into `ops.business_central_sync` after every booking.
+
+Retries: POST is retried only on 429, because a POST that failed on 5xx may have been committed; the next run finds
+the document by its key and updates it instead of creating a duplicate. A document that fails 3 times with the same
+hash waits as a dead letter until its data changes or `--retry FAILED` is used.
+
+### Fields prepared for the YVS specification
+
+YVS, the partner that implements Business Central for Vio, specifies the integration in the files
+`VIO_Data warhouse_Integration mapping fields-V1.2.xlsx` and `VIO_SO PO integration scenarios-V1.2.xlsx`. The
+`business_central` tables already carry every field of those specifications that Travel Compositor provides; the push
+sends only the fields of the standard API v2.0 until YVS publishes its endpoints and dimensions.
+
+| Specification field | Column | Source in Travel Compositor |
+|---|---|---|
+| MAIN BOOKING dimension (Main EXA) | `sales_invoices.main_booking_ref` | `bookingAssociatedTo`, else the booking itself |
+| Your Reference | `sales_invoices.your_reference` | `referralId` |
+| Sales channel, brand (microsite), trip type, service end date, total passengers | `sales_channel`, `microsite`, `trip_type`, `service_end_date`, `pax` | booking |
+| Salesperson | `sales_invoices.salesperson_username` | `user.username` of the booking |
+| Agency management fee | `sales_invoices.agency_management_fee` | `pricebreakdown.agencyManagementFee` |
+| Deposit and balance lines, balance due date | `deposit_amount`, `balance_amount`, `balance_due_date` | `payment.amount`, `payment.deferredAmount`, `payment.deferredLimitDate` |
+| Cancellation date | `sales_invoices.cancellation_date`, `purchase_invoices.cancellation_date` | service `cancelationDate` |
+| Destination country dimension | `sales_invoices.destination_country` | country of the first service |
+| Supplier confirmation number | `purchase_invoices.supplier_confirmation` | service `bookingReference` |
+| Currency factor | `purchase_invoices.currency_factor` | service `pricebreakdown.exchangeRateMicrosite` |
+| Amendments | `purchase_invoices.amendment_count`, view `silver.booking_service_amendments` | service `amendments` |
+| Customer phone, VAT registration, credit limit, deferred terms | `customers.phone_number`, `tax_registration_number`, `credit_limit`, `deferred_days` | agency |
+| Vendor phone | `vendors.phone_number` | supplier |
+
+Data the specifications ask for that Travel Compositor does not hold, so Vio or YVS must provide it: agent currency
+and its exchange rate, business unit per user, supplier payment terms, vendor invoice numbers, item per service type,
+TCODE (credit or refund reason), invoice number series, payment requests, and approved customer and vendor mappings
+(today 7,241 sales invoices wait as `CUSTOMER_UNMAPPED` and 23,656 purchase invoices as `VENDOR_UNMAPPED`).
+
+## Orchestration
+
+| Job or unit | Schedule (Asia/Ho_Chi_Minh) | Tasks | Run as |
+|---|---|---|---|
+| `vio_travel_ingest_transform_publish` | every 30 minutes at minute 05 and 35 | `extract_travel_compositor` → `build_bronze_silver_gold` → `build_business_central_tables` → `check_data_quality` (`run_if: ALL_DONE`) | service principal `vio-travel-pipeline` |
+| `vio_travel_ingest_accommodation_catalog` | Sunday 03:15 | `extract_accommodation_catalog`: accommodation catalog snapshot | service principal |
+| `vio_travel_apply_governance` | Sunday 03:45, and after each deploy | tags, masks, grants, comments, metric views | deploying user (catalog owner) |
+| `vio_travel_backfill_bookings` | manual | `plan_backfill_windows` → for-each `extract_booking_windows` (one month per iteration, 3 in parallel) | service principal |
+| `vio-push-business-central.timer` (systemd) | every 5 minutes, acts after each finished job run | `push_to_business_central.py --on-new-run` under `flock` | the Business Central user |
+| SQL alert `pipeline_freshness` | hourly at minute 50 | dead-man switch on `ops.dq_results` | deploying user |
+
+Retries and limits: `extract_travel_compositor` 2 retries 5 minutes apart; the pipeline retries an update once itself
+(`pipelines.numUpdateRetryAttempts`), so its task has no retry; `build_business_central_tables` 1 retry; job timeout 2 hours; one active
+run per job, later runs queue.
+
+The backfill job only lands files and never moves the watermark; the next scheduled run loads them, so the two jobs
+never update the pipeline or rebuild `business_central` at the same time. A failed month is re-read with "Repair
+run".
+
+## Data quality
+
+| Where | What | Effect |
+|---|---|---|
+| pipeline expectations | keys present, dates ordered, amounts present, payload parsed (`bronze_`, `silver_`) | rows without a key are dropped, other rules warn; counts copied into `ops.dq_results` |
+| `build_business_central_tables` checks | unique document keys, every document has a customer or vendor and a currency, one currency per invoice, Business Central field lengths | severity `block`: nothing is published, the push keeps the previous build |
+| `build_business_central_tables` and `check_data_quality` warnings | held documents, totals that differ from lines, unknown service arrays, orphan facts, overdue payments | severity `warn`: recorded and shown on the dashboard |
+| `check_data_quality` end-to-end checks (`e2e_`) | extract failing or stale per entity, pipeline failed or stale, `business_central` behind silver, push stalled | severity `alert`: the task fails and the failure e-mail goes out |
+
+Every check writes one row per run into `ops.dq_results` with the number of failing rows and up to 5 sample keys. A
+check name starts with the layer or step it tests: `bronze_`, `silver_`, `gold_`, `business_central_`, `e2e_`.
+
+## Monitoring and freshness
+
+| Stage | Fresh within | Watched by |
+|---|---|---|
+| Travel Compositor to silver | 30 minutes plus run time | `e2e_extract_failing_or_stale`, `e2e_pipeline_failed_or_stale` |
+| silver to gold, dashboard, Genie | same pipeline update | expectations, `gold_` checks |
+| silver to `business_central` | same job run | `e2e_business_central_behind_silver` |
+| `business_central` to Business Central | 5 minutes after the run, 100 bookings per push | `e2e_push_stalled`, `e2e_sales_waiting_for_push` |
+| the job itself | | SQL alert `pipeline_freshness` (no `e2e_` row for 75 minutes, evaluated hourly, so up to about 2 hours to detect) |
+
+Notifications: job e-mail on failure and on runs over 30 minutes (`health` rule), pipeline e-mail on update and flow
+failure, desktop notification when the push unit fails. The dashboard page Pipeline operations shows run times, API
+calls, check results and the push backlog from `ops`.
+
+## Performance and cost
+
+- Layout: liquid clustering (`CLUSTER BY` on join keys of facts, `CLUSTER BY AUTO` elsewhere) instead of partitions
+  and Z-ORDER; predictive optimization on the catalog runs OPTIMIZE, VACUUM and statistics.
+- Silver streaming tables have change data feed and row tracking; bronze has deletion vectors and row tracking.
+- Serverless compute everywhere; the pipeline is triggered, not continuous, because the source changes at most every
+  30 minutes and Free Edition has a daily compute quota.
+- Free Edition limits shape the design: one active pipeline, at most 5 concurrent tasks, 500 tables per metastore.
+  Each pipeline table counts twice (its hidden `__materialization_*` table), so datasets read by nothing inside the
+  pipeline are plain views created by `vio_travel_apply_governance`.
+- Retention: landing files 90 days; `ops.api_calls` and `ops.dq_results` 180 days; bronze, history tables,
+  `ops.ingest_runs`, `ops.publish` and `ops.business_central_sync` are kept as audit trail.
+
+## Governance and security
+
+| Control | Implementation |
+|---|---|
+| Identity | jobs and the pipeline run as the service principal `vio-travel-pipeline`; nobody runs production code as a person except `vio_travel_apply_governance` and the push |
+| Secrets | Travel Compositor credentials in the secret scope `vio-tc`, readable only by the service principal and the owner; no credential in the repo |
+| Personal data | column tag `pii` (`email`, `phone`, `name`, `address`) and table tag `contains_pii`; column masks with `governance.mask_pii`, declared in the pipeline schemas of silver and `gold.dim_user`, show values only to the group `vio_pii_readers`; `business_central` is not masked because the push must send real e-mails and addresses, and grants keep it to the service principal and the catalog owner |
+| Access | every workspace user (`account users`) reads `gold`, masked; only the service principal and the catalog owner read `bronze`, `silver` and `business_central` |
+| Documentation | comments on every silver and gold column (pipeline schemas) and on every table, including `ops`, `ref` and `business_central`; Catalog Explorer and Genie read them |
+| Lineage and audit | Unity Catalog lineage across pipeline and jobs; pipeline event log, `ops.ingest_runs`, `ops.publish`, `ops.business_central_sync` |
+
+Raw API files and anything under `data/` never go into git (`.gitignore`).
+
+## Conventions
+
+| Item | Convention | Example |
+|---|---|---|
+| Catalog, schema, table, column | snake_case, English, plural entity names in silver | `silver.booking_services`, `booking_ref` |
+| Gold tables | `dim_`, `fact_`, `obt_` prefixes; metric views end in `_metrics` | `fact_pending_payment` |
+| History tables | `<entity>_history` with `__START_AT`, `__END_AT` | `silver.agencies_history` |
+| Bronze tables | `tc_<entity>`, source system prefix | `bronze.tc_bookings` |
+| Jobs and pipelines | `vio_travel_<verb>_<object>`: the name says what it does, the schedule says when; file `<name>.<type>.yml` | `vio_travel_ingest_transform_publish`, `resources/vio_travel_ingest_transform_publish.job.yml` |
+| Task keys | `<verb>_<object>`, source file or folder named like the task | task `extract_travel_compositor`, file `src/extract_travel_compositor.py`; task `build_bronze_silver_gold`, folder `src/build_bronze_silver_gold/` |
+| Check names | `<layer or schema>_<what is wrong>` | `gold_fact_orphans`, `business_central_sales_key_unique` |
+| Tags | job and pipeline tag `project: vio_travel`, `contains_pii: "true"` where personal data is read; UC tags `contains_pii`, `pii` | |
+| Python | ruff lint and format, line length 120, standard library plus `requests` and `databricks-sdk` | |
+| Commits | imperative English subject, one concern per commit | `Retry the rate source on timeouts and 5xx` |
+| Branches | `main` is deployed; work on `<user>-dev/<topic>` and merge | `harry-dev/lakehouse` |
+
+## Development
+
+Requirements: Python 3.11 or later, [uv](https://docs.astral.sh/uv/), the Databricks CLI (tested with v1.22.1)
+logged in to the workspace, and the Azure CLI for the push.
 
 ```bash
-# lint, format, tests
 uvx ruff check . && uvx ruff format --check .
-uv run --no-project --with pytest --with requests pytest -q tests
+uv run --no-project --with pytest --with requests --with databricks-sdk pytest -q tests
+git config core.hooksPath .githooks        # run the CI checks before every git push
+databricks bundle validate -t prod
+```
 
-# deploy to the workspace folder /Workspace/Users/<you>/vio-data-platform/prod, then apply governance, run once
+Targets: `dev` deploys to catalog `vio_travel_dev` with `mode: development` (resource names prefixed, schedules
+paused); `prod` deploys to `vio_travel`. Free Edition allows one active pipeline, so stop the prod pipeline before
+updating the dev one. To create a new catalog, run `sql/setup-catalog.sql` with the catalog name replaced.
+
+CI (`.github/workflows/ci.yml`) runs ruff, the tests, checks that the dashboard and Genie JSON match their
+generators, and `databricks bundle validate` when the repository secrets `DATABRICKS_HOST` and `DATABRICKS_TOKEN`
+exist. `.githooks/pre-push` runs the same checks locally.
+
+## Operations
+
+```bash
+# deploy, apply governance, run once
 databricks bundle deploy -t prod
-databricks bundle run vio_travel_governance -t prod
-databricks bundle run vio_travel_pipeline -t prod
+databricks bundle run vio_travel_apply_governance -t prod
+databricks bundle run vio_travel_ingest_transform_publish -t prod
 
-# re-extract one day onwards, or a long range month by month
-databricks bundle run vio_travel_pipeline -t prod --params backfill_from=2026-11-01
-databricks bundle run vio_travel_backfill -t prod --params backfill_from=2015-01-01,backfill_to=2026-11-16
+# re-extract from a day onwards (moves the watermark), or a long range month by month (does not)
+databricks bundle run vio_travel_ingest_transform_publish -t prod --params backfill_from=2026-11-01
+databricks bundle run vio_travel_backfill_bookings -t prod --params backfill_from=2015-01-01,backfill_to=2026-11-16
 
-# rebuild silver and gold from bronze (bronze itself is never reset)
+# rebuild silver and gold from bronze; bronze and snapshot history are kept
 databricks pipelines start-update <pipeline_id> --full-refresh
 
-# after a code change in bc_tables, rebuild even though silver did not change
-databricks bundle run vio_travel_pipeline -t prod --params rebuild=true
+# rebuild business_central after a code change in build_business_central_tables although silver did not change
+databricks bundle run vio_travel_ingest_transform_publish -t prod --params rebuild=true
 
-# read the accommodation catalog now instead of on Sunday
-databricks bundle run vio_travel_catalog -t prod
-
-# regenerate the dashboard or the Genie space after editing their scripts
+# regenerate the dashboard or Genie space after editing their scripts
 python3 dashboards/build_dashboard.py && python3 genie/build_genie_space.py && databricks bundle deploy -t prod
 
-# anomaly detection (freshness and completeness) on a schema; not a bundle resource yet
-databricks data-quality create-monitor --json '{"object_type": "schema", "object_id": "<schema_id>", "anomaly_detection_config": {}}'
-
-# local push into Business Central (needs `az login` as the trial owner)
-cd local && uv run --no-project --with databricks-sdk --with requests push_to_bc.py --dry-run
+# Business Central push (needs `az login` as a Business Central user)
+cd local
+uv run --no-project --with databricks-sdk --with requests push_to_business_central.py --dry-run
 cp systemd/*.service systemd/*.timer ~/.config/systemd/user/ && systemctl --user daemon-reload
-systemctl --user enable --now vio-push-bc.timer
-# send again the documents whose latest result is SKIPPED or FAILED, although their content did not change
-uv run --no-project --with databricks-sdk --with requests push_to_bc.py --retry SKIPPED,FAILED
+systemctl --user enable --now vio-push-business-central.timer
+uv run --no-project --with databricks-sdk --with requests push_to_business_central.py --retry SKIPPED,FAILED
 
-# when a Business Central number series runs out (trial My Company: P-INV+ ended at 109999); the line starts
-# in 2015 because documents take their number by posting date
+# a Business Central number series that ran out (documents take their number by posting date, so start in 2015)
 uv run --no-project --with databricks-sdk --with requests extend_number_series.py \
   --series P-INV+ --line_no 20000 --starting_no 110000 --ending_no 199999 --starting_date 2015-01-01
 ```
 
-The `dev` target writes to catalog `vio_travel_dev` (create it first with `sql/setup-catalog.sql`, catalog name
-changed) and pauses the schedules. Free Edition allows one active pipeline, so stop the prod pipeline before an
-update of the dev one.
+`local/config.json` holds the target company, G/L accounts, posting groups, the push scope and limits; it contains
+IDs only, no credential.
 
-## Secrets and personal data
+## Limitations
 
-Travel Compositor credentials live in the Databricks secret scope `vio-tc`; Business Central uses the Azure CLI
-login of the person running `local/push_to_bc.py`. No credential is stored in this repo. Bronze, silver and some gold
-tables hold personal data of travellers, users and agencies; raw API files never go into git (`.gitignore`).
+- The Travel Compositor API filters bookings by update day only, so changes arrive with the next 30-minute run, not in
+  real time.
+- Exchange rates come from the ECB and from Travel Compositor costs, not from the rates Vio Finance uses.
+- `ref.customer_map` and `ref.vendor_map` hold lab seed rows that Vio Finance has not approved.
+- Posting, credit memos, deposits and the business unit dimension are not implemented.
+- The push depends on a workstation and a delegated login; production needs an app registration and a job.

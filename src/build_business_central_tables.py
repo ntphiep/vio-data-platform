@@ -1,14 +1,14 @@
-"""Task bc_tables - integration output shaped for the Business Central API, catalog <catalog>:
+"""Task build_business_central_tables - integration output shaped for the Business Central API, catalog <catalog>:
 
 business_central.*    customers, vendors, sales and purchase invoices and lines, each document with a payload
                       hash and an action (UPSERT, or CANCEL for cancelled bookings and services)
 ops.dq_results        data-quality results of this run
 ops.publish           write-audit-publish: table versions are published only when every blocking check passes;
-                      local/push_to_bc.py reads the tables AS OF the last published versions, so it never sees a
+                      local/push_to_business_central.py reads the tables AS OF the last published versions, so it never sees a
                       half-written or failed build, and header and line tables always match.
 
 Check names start with the layer they test (silver_, bronze_, bc_). End-to-end freshness checks run in the last
-task, data_quality.py. The task skips the rebuild when silver and ref have not changed since the last publish
+task, check_data_quality.py. The task skips the rebuild when silver and ref have not changed since the last publish
 (content token in ops.build_state, recorded on every run); job parameter rebuild=true forces it.
 """
 
@@ -29,6 +29,15 @@ SERVICE_ARRAYS = [
 ]
 SCHEMA = "business_central"
 TABLES = ["customers", "vendors", "sales_invoices", "sales_lines", "purchase_invoices", "purchase_lines"]
+# Table comments, set again after every CREATE OR REPLACE (which drops them).
+TABLE_COMMENTS = {
+    "customers": "Business Central customers: one per Travel Compositor agency (AG<id>), plus customers of ref.customer_map.",
+    "vendors": "Business Central vendors: Travel Compositor suppliers (SP<id>), providers (PV<code>), ref.vendor_map.",
+    "sales_invoices": "One sales invoice per BOOKED, RQ or CANCELED booking (externalDocumentNumber); held when hold_reason is set.",
+    "sales_lines": "Lines of sales_invoices: one per BOOKED or RQ service with a non-zero sale amount, in the sale currency.",
+    "purchase_invoices": "One purchase invoice per service with a non-zero cost (vendorInvoiceNumber = purchase_key); held when hold_reason is set.",
+    "purchase_lines": "One line per UPSERT purchase invoice: the service cost in the cost currency.",
+}
 PII_TABLES = ["customers", "vendors"]
 # Type code in purchase_key and vendor_invoice_number: Travel Compositor service IDs are unique only inside one
 # service type. Codes of synced documents must not change (the push would treat the old key as removed), so
@@ -57,7 +66,7 @@ TYPE_CODES = {
 }
 # Vendor number of an API service without supplier ID: the provider code upper-cased before non-alphanumeric
 # characters are removed, so lowercase letters are kept (Business Central Code fields are upper case). Two
-# providers that still map to one number make blocking check bc_party_number_unique fail; ref.vendor_map
+# providers that still map to one number make blocking check business_central_party_number_unique fail; ref.vendor_map
 # (source_kind PROVIDER) then gives one of them its own number.
 PROVIDER_VENDOR_NUMBER = "left('PV' || regexp_replace(upper(s.provider), '[^A-Z0-9]', ''), 20)"
 
@@ -128,10 +137,10 @@ def main():
     sql(f"""CREATE TABLE IF NOT EXISTS {c}.ref.vendor_map (
         source_kind STRING, source_key STRING, bc_vendor_no STRING, display_name STRING, approved_by STRING,
         note STRING)""")
-    unchanged, token = silver_unchanged(sql, c, "bc_tables", a.rebuild)
+    unchanged, token = silver_unchanged(sql, c, "build_business_central_tables", a.rebuild)
     if unchanged:
-        # recorded anyway, so data_quality sees that this task checked the current silver
-        record_build(sql, c, "bc_tables", a.run_id, token)
+        # recorded anyway, so check_data_quality sees that this task checked the current silver
+        record_build(sql, c, "build_business_central_tables", a.run_id, token)
         print("silver and ref unchanged since the last publish, nothing to do")
         return
 
@@ -143,13 +152,15 @@ def main():
                left(coalesce(nullif(trim(name),''), business_name), 100) AS display_name,
                left(regexp_extract(coalesce(billing_email, email), '[^,; ]+@[^,; ]+', 0), 80) AS email,
                left(country, 10) AS country, left(city, 30) AS city, left(address, 100) AS address_line1,
-               left(postal_code, 20) AS postal_code,
+               left(postal_code, 20) AS postal_code, left(phone, 30) AS phone_number,
+               left(tax_id, 20) AS tax_registration_number, invoice_type, deferred_payment_allowed,
+               deferred_days, deferred_limit AS credit_limit,
                sha2(to_json(named_struct('n', name, 'e', coalesce(billing_email, email), 'c', country,
                                          'ci', city, 'a', address)), 256) AS payload_hash
         FROM {c}.silver.agencies
         UNION ALL
-        SELECT DISTINCT m.bc_customer_no, NULL, m.display_name, NULL, NULL, NULL, NULL, NULL,
-               sha2(m.display_name, 256)
+        SELECT DISTINCT m.bc_customer_no, NULL, m.display_name, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+               NULL, NULL, NULL, sha2(m.display_name, 256)
         FROM {c}.ref.customer_map m
         WHERE m.bc_customer_no NOT IN (SELECT 'AG' || agency_id FROM {c}.silver.agencies)""")
     # Documents are created for BOOKED and RQ; CANCELED only updates what was sent before
@@ -181,6 +192,12 @@ def main():
                b.agency_id, b.payload:agencyBookingReference::string AS agency_reference,
                to_date(b.created_at) AS invoice_date, b.start_date AS service_start_date, b.currency AS currency_code,
                b.total_price, coalesce(l.lines_total, 0) AS lines_total, l.line_currencies, b.last_update_at,
+               -- fields of the YVS sales specification (API_Sales_T01) that Travel Compositor provides; the
+               -- push does not send them yet, they wait for the YVS endpoints and dimensions
+               b.main_booking_ref, b.referral_id AS your_reference, b.sales_channel, b.microsite, b.trip_type,
+               b.end_date AS service_end_date, b.pax, b.username AS salesperson_username, b.agency_management_fee,
+               b.paid_amount AS deposit_amount, b.deferred_amount AS balance_amount,
+               b.deferred_limit_date AS balance_due_date, sv.cancellation_date, sv.destination_country,
                -- the hash of an UPSERT document keeps the shape used since the first push, so a code change
                -- does not make every synced document look new; a CANCEL gets its own hash
                sha2(CASE WHEN b.doc_action = 'CANCEL' THEN 'CANCEL ' ELSE '' END ||
@@ -191,6 +208,9 @@ def main():
                           array_join(array_sort(collect_set(currency)), ',') AS line_currencies,
                           sort_array(collect_list(named_struct('n', line_no, 'd', description, 'a', amount))) AS lines
                    FROM {b}.sales_lines GROUP BY booking_ref) l ON l.booking_ref = b.booking_ref
+        LEFT JOIN (SELECT booking_ref, max(cancellation_date) AS cancellation_date,
+                          min_by(destination_country, start_date) AS destination_country
+                   FROM {c}.silver.booking_services GROUP BY booking_ref) sv ON sv.booking_ref = b.booking_ref
         WHERE b.doc_action = 'CANCEL' OR l.booking_ref IS NOT NULL""")
     # Purchases: one invoice per service (YVS spec API_Purchases_T01 row 5). Vendor: Travel Compositor
     # supplier ID; for API services without one, the provider code; for manual services, ref.vendor_map.
@@ -219,6 +239,9 @@ def main():
                is_manual, vendor_number, hold_reason, status, supplier_id, provider, supplier_name,
                cost_currency AS currency_code, service_id || '-' || type_code AS vendor_invoice_number,
                provider_reference AS vendor_order_number, to_date(booking_created_at) AS invoice_date,
+               -- fields of the YVS purchase specification (API_Purchases_T01), not sent by the push yet
+               supplier_confirmation, cancellation_date, exchange_rate_microsite AS currency_factor,
+               amendment_count, start_date AS service_start_date, end_date AS service_end_date,
                cost_amount AS lines_total,
                sha2(CASE WHEN doc_action = 'CANCEL' THEN 'CANCEL ' ELSE '' END ||
                     to_json(named_struct('v', vendor_number, 'c', cost_currency, 'a', cost_amount,
@@ -234,15 +257,18 @@ def main():
                left(coalesce(nullif(trim(legal_name),''), commercial_name), 100) AS display_name,
                left(regexp_extract(email, '[^,; ]+@[^,; ]+', 0), 80) AS email, left(country, 10) AS country,
                left(address, 100) AS address_line1, left(tax_id, 20) AS tax_registration_number,
+               left(phone, 30) AS phone_number,
                sha2(to_json(named_struct('n', coalesce(legal_name, commercial_name), 'e', email, 'c', country,
                                          'a', address, 't', tax_id)), 256) AS payload_hash
         FROM {c}.silver.suppliers
         UNION ALL
-        SELECT bc_number, NULL, display_name, NULL, NULL, NULL, NULL, sha2(display_name, 256) FROM (
+        SELECT bc_number, NULL, display_name, NULL, NULL, NULL, NULL, NULL, sha2(display_name, 256) FROM (
           SELECT DISTINCT vendor_number AS bc_number, provider AS display_name FROM {b}.purchase_invoices
           WHERE supplier_id IS NULL AND NOT is_manual AND vendor_number LIKE 'PV%'
           UNION SELECT DISTINCT bc_vendor_no, display_name FROM {c}.ref.vendor_map) v
         WHERE bc_number NOT IN (SELECT 'SP' || supplier_id FROM {c}.silver.suppliers)""")
+    for t, text in TABLE_COMMENTS.items():
+        sql(f"COMMENT ON TABLE {b}.{t} IS '{text}'")
     for t in PII_TABLES:
         sql(f"ALTER TABLE {b}.{t} SET TAGS ('contains_pii' = 'true')")
 
@@ -259,42 +285,42 @@ def main():
             f"""SELECT booking_ref AS k FROM {c}.silver.bookings
             GROUP BY booking_ref HAVING count(*) > 1""",
         ),
-        "bc_sales_key_unique": (
+        "business_central_sales_key_unique": (
             "block",
             f"""SELECT external_document_number AS k FROM {b}.sales_invoices
             GROUP BY 1 HAVING count(*) > 1""",
         ),
-        "bc_purchase_key_unique": (
+        "business_central_purchase_key_unique": (
             "block",
             f"""SELECT purchase_key AS k FROM {b}.purchase_invoices
             GROUP BY 1 HAVING count(*) > 1""",
         ),
-        "bc_party_number_unique": (
+        "business_central_party_number_unique": (
             "block",
             f"""SELECT bc_number AS k FROM {b}.customers GROUP BY 1 HAVING count(*) > 1
             UNION ALL SELECT bc_number FROM {b}.vendors GROUP BY 1 HAVING count(*) > 1""",
         ),
-        "bc_sales_invoice_without_customer": (
+        "business_central_sales_invoice_without_customer": (
             "block",
             f"""SELECT external_document_number AS k FROM {send_sales} i
             LEFT ANTI JOIN {b}.customers p ON p.bc_number = i.customer_number""",
         ),
-        "bc_purchase_invoice_without_vendor": (
+        "business_central_purchase_invoice_without_vendor": (
             "block",
             f"""SELECT purchase_key AS k FROM {send_purch} i
             LEFT ANTI JOIN {b}.vendors p ON p.bc_number = i.vendor_number""",
         ),
-        "bc_document_without_currency": (
+        "business_central_document_without_currency": (
             "block",
             f"""SELECT external_document_number AS k FROM {send_sales}
             WHERE currency_code IS NULL UNION ALL SELECT purchase_key FROM {send_purch} WHERE currency_code IS NULL""",
         ),
-        "bc_sales_lines_mixed_currency": (
+        "business_central_sales_lines_mixed_currency": (
             "block",
             f"""SELECT external_document_number AS k FROM {send_sales}
             WHERE line_currencies <> currency_code""",
         ),
-        "bc_field_length_over_limit": (
+        "business_central_field_length_over_limit": (
             "block",
             f"""SELECT bc_number AS k FROM {b}.customers WHERE length(bc_number) > 20
             UNION ALL SELECT bc_number FROM {b}.vendors WHERE length(bc_number) > 20
@@ -302,55 +328,39 @@ def main():
             UNION ALL SELECT external_document_number FROM {send_sales} WHERE length(external_document_number) > 35""",
         ),
         # warn: recorded in ops.dq_results only
-        "bronze_malformed_line": (
-            "warn",
-            f"""SELECT source_file AS k FROM {c}.bronze.tc_bookings WHERE doc IS NULL
-            UNION ALL SELECT source_file FROM {c}.bronze.tc_agencies WHERE doc IS NULL
-            UNION ALL SELECT source_file FROM {c}.bronze.tc_suppliers WHERE doc IS NULL""",
-        ),
-        "silver_booking_without_last_update": (
-            "warn",
-            f"""SELECT booking_ref AS k FROM {c}.silver.bookings
-            WHERE last_update_at IS NULL""",
-        ),
         "silver_unknown_service_array": (
             "warn",
             f"""SELECT DISTINCT e.key AS k FROM {c}.silver.bookings b,
             LATERAL variant_explode(b.payload) e WHERE lower(e.key) LIKE '%service%' AND e.key NOT IN ({known})""",
         ),
-        "silver_active_service_without_amount": (
-            "warn",
-            f"""SELECT booking_ref || '/' || service_id AS k
-            FROM {c}.silver.booking_services WHERE status IN ('BOOKED','RQ') AND (sale_amount IS NULL OR cost_amount IS NULL)""",
-        ),
-        "bc_active_booking_without_lines": (
+        "business_central_active_booking_without_lines": (
             "warn",
             f"""SELECT b.booking_ref AS k FROM {c}.silver.bookings b
             LEFT ANTI JOIN {b}.sales_invoices i ON i.external_document_number = b.booking_ref
             WHERE b.status IN ('BOOKED','RQ')""",
         ),
-        "bc_sales_held_customer_unmapped": (
+        "business_central_sales_held_customer_unmapped": (
             "warn",
             f"""SELECT external_document_number AS k
             FROM {b}.sales_invoices WHERE hold_reason = 'CUSTOMER_UNMAPPED' AND doc_action = 'UPSERT'""",
         ),
-        "bc_purchase_held_vendor_unmapped": (
+        "business_central_purchase_held_vendor_unmapped": (
             "warn",
             f"""SELECT purchase_key AS k
             FROM {b}.purchase_invoices WHERE hold_reason = 'VENDOR_UNMAPPED' AND doc_action = 'UPSERT'""",
         ),
-        "bc_held_party_not_in_snapshot": (
+        "business_central_held_party_not_in_snapshot": (
             "warn",
             f"""SELECT external_document_number AS k FROM {b}.sales_invoices
             WHERE hold_reason = 'AGENCY_NOT_IN_SNAPSHOT' UNION ALL SELECT purchase_key FROM {b}.purchase_invoices
             WHERE hold_reason = 'SUPPLIER_NOT_IN_SNAPSHOT'""",
         ),
-        "bc_booking_total_differs_from_lines": (
+        "business_central_booking_total_differs_from_lines": (
             "warn",
             f"""SELECT external_document_number AS k FROM {send_sales}
             WHERE abs(total_price - lines_total) > 0.05""",
         ),
-        "bc_negative_document_total": (
+        "business_central_negative_document_total": (
             "warn",
             f"""SELECT external_document_number AS k FROM {send_sales}
             WHERE lines_total < 0 UNION ALL SELECT purchase_key FROM {send_purch} WHERE lines_total < 0""",
@@ -381,7 +391,7 @@ def main():
         "run_id", "current_timestamp() AS published_at", "versions"
     ).write.mode("append").saveAsTable(f"{c}.ops.publish")
     print("published", versions)
-    record_build(sql, c, "bc_tables", a.run_id, token)
+    record_build(sql, c, "build_business_central_tables", a.run_id, token)
 
 
 if __name__ == "__main__":

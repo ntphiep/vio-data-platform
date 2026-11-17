@@ -8,7 +8,7 @@ resources:
     bronze:
       catalog_name: ${var.catalog}
       name: bronze
-      comment: Append-only copy of every landed record as VARIANT (Auto Loader in pipeline vio_travel_lakehouse). Contains personal data.
+      comment: Append-only copy of every landed record as VARIANT (Auto Loader in pipeline vio_travel_build_bronze_silver_gold). Contains personal data.
       lifecycle: {prevent_destroy: true}
     silver:
       catalog_name: ${var.catalog}
@@ -22,7 +22,7 @@ resources:
     business_central:
       catalog_name: ${var.catalog}
       name: business_central
-      comment: Integration output shaped for the Business Central API; read by local/push_to_bc.py. Rebuilt each run.
+      comment: Integration output shaped for the Business Central API; read by local/push_to_business_central.py. Rebuilt each run.
     ref:
       catalog_name: ${var.catalog}
       name: ref
@@ -45,5 +45,5 @@ resources:
       schema_name: ${resources.schemas.raw.name}
       name: landing
       volume_type: MANAGED
-      comment: One folder per entity, ingest_date and run; files older than 90 days are removed by extract_tc.
+      comment: One folder per entity, ingest_date and run; files older than 90 days are removed by extract_travel_compositor.
       lifecycle: {prevent_destroy: true}

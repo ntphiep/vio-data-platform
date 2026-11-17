@@ -3,7 +3,7 @@
 The trial company My Company ships purchase invoice series P-INV+ ending at 109999; once those numbers are used,
 every POST purchaseInvoices fails with "You cannot assign new numbers from the number series P-INV+". API v2.0
 has no number series entity, so the line goes in as a RapidStart configuration package (table 309 No. Series
-Line), the same way push_to_bc.py loads exchange rates. A new line with a later starting date takes over from
+Line), the same way push_to_business_central.py loads exchange rates. A new line with a later starting date takes over from
 the exhausted one.
 
 Applying a configuration package modifies a row that already exists, so the script first reads the lines of the
@@ -12,7 +12,7 @@ ODataV4 web service (Business Central page Web Services, object type Page, objec
 config.json key no_series_lines_service). When the service is missing or the lines cannot be read, the script
 refuses too: it never writes a line it could not check.
 
-Usage (needs `az login` as the trial owner, same config.json as push_to_bc.py):
+Usage (needs `az login` as the trial owner, same config.json as push_to_business_central.py):
     uv run --no-project --with databricks-sdk --with requests extend_number_series.py \
         --series P-INV+ --line_no 20000 --starting_no 110000 --ending_no 199999
 """
@@ -22,7 +22,7 @@ import datetime as dt
 import sys
 from xml.sax.saxutils import escape
 
-from push_to_bc import BC, load_cfg, odata_str
+from push_to_business_central import BC, load_cfg, odata_str
 
 
 def existing_line_numbers(bc, service, series):

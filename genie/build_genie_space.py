@@ -16,23 +16,29 @@ NS = uuid.UUID("6f1c2d4e-0000-4000-8000-000000000001")
 TABLES = {
     "gold.obt_booking_service": "One service of a booking with every attribute; use for supplier, destination, "
     "service category and accommodation questions. Filter is_active AND booking_is_active for sold services.",
-    "gold.fact_booking": "One booking. is_active = status BOOKED or RQ. Amounts in the booking currency (USD).",
+    "gold.fact_booking": "One booking. is_active = status BOOKED or RQ. Amounts in the booking currency (column "
+    "currency): USD except a handful of EUR bookings.",
     "gold.dim_agency": "Agencies (customers of Vio). agency_key -1 = Unknown.",
     "gold.dim_date": "Calendar; date_key is yyyyMMdd.",
     "gold.dim_travel_idea": "Travel ideas (packaged itineraries) linked to bookings by idea_key.",
     "gold.dim_accommodation": "Booked hotels with category, chain and rating on a 10 scale.",
-    "gold.fact_pending_payment": "Payments still due; days_overdue > 0 is late; ageing_bucket groups them.",
+    "gold.fact_pending_payment": "Payments still due, amounts in currency. Overdue when due_date < current_date(); "
+    "days overdue = datediff(current_date(), due_date). Ageing buckets are in receivable_metrics.",
     "gold.fact_booking_payment": "Payments recorded on bookings (first, second, additional, manual).",
     "gold.fact_purchase_attempt": "Checkouts started on the microsite; is_converted when they became a booking.",
     "gold.fact_booking_status_change": "History of booking status and amount changes.",
-    "gold.booking_metrics": "Metric view: bookings, revenue, gross margin, cancellation rate.",
-    "gold.service_metrics": "Metric view: services, sale amount, cost and margin by supplier and destination.",
-    "gold.receivable_metrics": "Metric view: amounts due and overdue by agency and ageing bucket.",
+    "gold.booking_metrics": "Metric view: bookings, revenue, gross margin, cancellation rate; dimension Currency.",
+    "gold.service_metrics": "Metric view: services, sale amount, cost and margin by supplier and destination, in the "
+    "booking currency; dimension Currency.",
+    "gold.receivable_metrics": "Metric view: amounts due and overdue as of today by agency and ageing bucket; "
+    "dimension Currency.",
 }
 INSTRUCTIONS = [
     "Vio Travel is a destination management company; bookings come from Travel Compositor.",
     "Revenue is total_price of active bookings (is_active). Gross margin is total_price minus net_provider.",
-    "Amounts are in the booking currency, USD for almost every booking; do not add amounts of different currencies.",
+    "Amounts are in the currency of their row: USD for every booking except a handful in EUR. Never add amounts of "
+    "different currencies: group by or filter on the currency column (Currency in the metric views) and show it.",
+    "Days overdue and ageing depend on today: use receivable_metrics, or compute from due_date with current_date().",
     "Prefer the metric views booking_metrics, service_metrics and receivable_metrics with MEASURE() for totals.",
     "Personal columns (names, e-mails, phones) are masked for most readers; do not try to unmask them.",
 ]
@@ -44,11 +50,11 @@ QUESTIONS = [
     "Which hotels were booked most, with their rating?",
 ]
 EXAMPLES = {
-    "Revenue and gross margin by month": f"""SELECT `Created month`, MEASURE(Revenue) AS revenue,
+    "Revenue and gross margin by month": f"""SELECT `Created month`, Currency, MEASURE(Revenue) AS revenue,
   MEASURE(`Gross margin`) AS gross_margin
-FROM {CATALOG}.gold.booking_metrics GROUP BY ALL ORDER BY 1""",
-    "Overdue amount by ageing bucket": f"""SELECT `Ageing bucket`, MEASURE(`Amount to pay`) AS amount_to_pay
-FROM {CATALOG}.gold.receivable_metrics GROUP BY ALL ORDER BY 1""",
+FROM {CATALOG}.gold.booking_metrics GROUP BY ALL ORDER BY 1, 2""",
+    "Overdue amount by ageing bucket": f"""SELECT `Ageing bucket`, Currency, MEASURE(`Amount to pay`) AS amount_to_pay
+FROM {CATALOG}.gold.receivable_metrics GROUP BY ALL ORDER BY 1, 2""",
 }
 
 

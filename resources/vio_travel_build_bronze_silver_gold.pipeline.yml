@@ -2,25 +2,25 @@ resources:
   pipelines:
     # Lakeflow Spark Declarative Pipeline: bronze (Auto Loader), silver (AUTO CDC, SCD type 1 and 2, AUTO CDC FROM
     # SNAPSHOT), gold (materialized views with liquid clustering and informational keys), expectations on every
-    # layer. Triggered by the job vio_travel_pipeline, not continuous: Free Edition allows one active pipeline and
+    # layer. Triggered by the job vio_travel_ingest_transform_publish, not continuous: Free Edition allows one active pipeline and
     # a daily compute quota, and the source changes every 30 minutes at most.
-    vio_travel_lakehouse:
-      name: vio_travel_lakehouse
+    vio_travel_build_bronze_silver_gold:
+      name: vio_travel_build_bronze_silver_gold
       catalog: ${var.catalog}
       schema: silver
       serverless: true
       channel: CURRENT
       continuous: false
-      root_path: ../src/lakehouse
+      root_path: ../src/build_bronze_silver_gold
       libraries:
         - glob:
-            include: ../src/lakehouse/**
+            include: ../src/build_bronze_silver_gold/**
       configuration:
         vio.catalog: ${var.catalog}
         # an update started by a job retries itself on retryable errors (default 5 times, each a full update);
         # one retry is enough here and keeps a failing update from using up the daily compute quota
         pipelines.numUpdateRetryAttempts: "1"
-      # the event log as a Unity Catalog table, read by the task data_quality and the dashboard page Operations
+      # the event log as a Unity Catalog table, read by the task check_data_quality and the dashboard page Operations
       event_log:
         catalog: ${var.catalog}
         schema: ops
@@ -32,4 +32,4 @@ resources:
           alerts: [ on-update-failure, on-update-fatal-failure, on-flow-failure ]
       tags:
         project: vio_travel
-        contains_pii: "true"
+        data_classification: personal_data

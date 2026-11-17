@@ -1,7 +1,7 @@
-"""Job vio_travel_backfill, task plan_windows - split a backfill range into windows for the for-each task.
+"""Job vio_travel_backfill_bookings, task plan_backfill_windows - split a backfill range into windows for the for-each task.
 
 Sets the task value `windows`, a list of {"from": "yyyy-mm-dd", "to": "yyyy-mm-dd"}; the for-each task
-extract_window runs extract_tc once per window (bookings only, --backfill_from/--backfill_to, watermark untouched),
+extract_booking_windows runs extract_travel_compositor once per window (bookings only, --backfill_from/--backfill_to, watermark untouched),
 a few windows at a time. Windows are calendar months by default, so a backfill of 2015 to today is about 140
 independent, retryable iterations instead of one long run.
 """

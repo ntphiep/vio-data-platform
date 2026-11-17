@@ -5,6 +5,11 @@ pipeline event log in ops.
 Queries name schema.table only; the catalog comes from dataset_catalog in resources/vio_travel_overview.dashboard.yml,
 so the dev target reads vio_travel_dev.
 
+Money: Travel Compositor prices the bookings in USD except a handful in EUR. Columns named *_usd sum USD amounts
+only (booking currency, sale currency or payment currency USD), so amounts of different currencies are never added;
+the rows in other currencies still count in the booking, service and payment counts.
+Days overdue and the ageing bucket depend on today, so they are computed here from due_date, not stored in gold.
+
 Usage: python3 dashboards/build_dashboard.py
 Edit this file, not the JSON: the JSON is generated.
 """
@@ -14,84 +19,98 @@ from pathlib import Path
 
 OUT = Path(__file__).with_name("vio_travel_overview.lvdash.json")
 
+# Ageing bucket of a pending payment as of today, the same CASE as the dimension of metric view receivable_metrics.
+AGEING_BUCKET = """CASE WHEN due_date IS NULL THEN 'No due date'
+                    WHEN due_date >= current_date() THEN 'Not due'
+                    WHEN datediff(current_date(), due_date) <= 30 THEN '1-30 days'
+                    WHEN datediff(current_date(), due_date) <= 60 THEN '31-60 days'
+                    WHEN datediff(current_date(), due_date) <= 90 THEN '61-90 days'
+                    ELSE 'Over 90 days' END"""
+
 DATASETS = {
     # ---------------- page: Bookings and revenue ----------------
     "booking_kpis": """
         SELECT count_if(is_active) AS active_bookings,
-               sum(CASE WHEN is_active THEN total_price END) AS revenue_usd,
-               sum(CASE WHEN is_active THEN gross_margin END) AS gross_margin_usd,
+               sum(CASE WHEN is_active AND currency = 'USD' THEN total_price END) AS revenue_usd,
+               sum(CASE WHEN is_active AND currency = 'USD' THEN gross_margin END) AS gross_margin_usd,
                count_if(is_cancelled) AS cancelled_bookings
         FROM gold.fact_booking""",
     "bookings_by_created_month": """
         SELECT date_trunc('MONTH', d.date) AS created_month, f.status, count(*) AS bookings,
-               sum(f.total_price) AS revenue_usd
+               sum(CASE WHEN f.currency = 'USD' THEN f.total_price END) AS revenue_usd
         FROM gold.fact_booking f JOIN gold.dim_date d ON d.date_key = f.created_date_key
         GROUP BY ALL""",
     "revenue_by_travel_month": """
         SELECT date_trunc('MONTH', d.date) AS travel_month, sum(f.total_price) AS revenue_usd,
                sum(f.gross_margin) AS gross_margin_usd
         FROM gold.fact_booking f JOIN gold.dim_date d ON d.date_key = f.start_date_key
-        WHERE f.is_active
+        WHERE f.is_active AND f.currency = 'USD'
         GROUP BY ALL""",
     "top_agencies": """
         SELECT a.agency_name, count(*) AS bookings, sum(f.total_price) AS revenue_usd
         FROM gold.fact_booking f JOIN gold.dim_agency a ON a.agency_key = f.agency_key
-        WHERE f.is_active
+        WHERE f.is_active AND f.currency = 'USD'
         GROUP BY ALL ORDER BY revenue_usd DESC LIMIT 15""",
     "bookings_by_trip_type": """
         SELECT trip_type, count(*) AS bookings FROM gold.fact_booking WHERE is_active GROUP BY ALL""",
     "top_destinations": """
         SELECT destination_country, count(DISTINCT booking_ref) AS bookings, count(*) AS services,
-               sum(sale_amount) AS sale_usd
+               sum(CASE WHEN sale_currency = 'USD' THEN sale_amount END) AS sale_usd
         FROM gold.obt_booking_service
         WHERE is_active AND booking_is_active AND destination_country IS NOT NULL
-          AND sale_currency = booking_currency
         GROUP BY ALL ORDER BY bookings DESC LIMIT 20""",
     # ---------------- page: Suppliers and cost ----------------
     "supplier_kpis": """
         SELECT count(DISTINCT supplier_key) AS suppliers_used,
-               sum(cost_in_booking_currency) AS cost_usd,
-               sum(margin_in_booking_currency) / nullif(sum(CASE WHEN margin_in_booking_currency IS NOT NULL
-                                                                  THEN sale_amount END), 0) AS service_margin_pct
+               sum(CASE WHEN booking_currency = 'USD' THEN cost_in_booking_currency END) AS cost_usd,
+               sum(CASE WHEN booking_currency = 'USD' THEN margin_in_booking_currency END)
+                 / nullif(sum(CASE WHEN booking_currency = 'USD' AND margin_in_booking_currency IS NOT NULL
+                                   THEN sale_amount END), 0) AS service_margin_pct
         FROM gold.obt_booking_service WHERE is_active AND booking_is_active""",
     "cost_by_category": """
         SELECT service_category, sum(cost_in_booking_currency) AS cost_usd,
-               sum(CASE WHEN sale_currency = booking_currency THEN sale_amount END) AS sale_usd
-        FROM gold.obt_booking_service WHERE is_active AND booking_is_active
+               sum(CASE WHEN sale_currency = 'USD' THEN sale_amount END) AS sale_usd
+        FROM gold.obt_booking_service WHERE is_active AND booking_is_active AND booking_currency = 'USD'
         GROUP BY ALL""",
     "top_suppliers": """
-        SELECT supplier_name, supplier_source, count(*) AS services, sum(cost_in_booking_currency) AS cost_usd
+        SELECT supplier_name, supplier_source, count(*) AS services,
+               sum(CASE WHEN booking_currency = 'USD' THEN cost_in_booking_currency END) AS cost_usd
         FROM gold.obt_booking_service WHERE is_active AND booking_is_active
         GROUP BY ALL ORDER BY cost_usd DESC LIMIT 20""",
     "cost_by_destination_country": """
         SELECT destination_country, sum(cost_in_booking_currency) AS cost_usd
         FROM gold.obt_booking_service
-        WHERE is_active AND booking_is_active AND destination_country IS NOT NULL
+        WHERE is_active AND booking_is_active AND destination_country IS NOT NULL AND booking_currency = 'USD'
         GROUP BY ALL ORDER BY cost_usd DESC LIMIT 15""",
     "supplier_source_mix": """
-        SELECT supplier_source, count(*) AS services, sum(cost_in_booking_currency) AS cost_usd
+        SELECT supplier_source, count(*) AS services,
+               sum(CASE WHEN booking_currency = 'USD' THEN cost_in_booking_currency END) AS cost_usd
         FROM gold.obt_booking_service WHERE is_active AND booking_is_active GROUP BY ALL""",
     # ---------------- page: Payments due ----------------
     "receivable_kpis": """
-        SELECT count(*) AS pending_payments, sum(amount_to_pay) AS amount_to_pay_usd,
-               sum(CASE WHEN days_overdue > 0 THEN amount_to_pay END) AS overdue_usd,
+        SELECT count(*) AS pending_payments,
+               sum(CASE WHEN currency = 'USD' THEN amount_to_pay END) AS amount_to_pay_usd,
+               sum(CASE WHEN currency = 'USD' AND due_date < current_date() THEN amount_to_pay END) AS overdue_usd,
                count(DISTINCT booking_ref) AS bookings_with_amount_due
         FROM gold.fact_pending_payment""",
-    "receivable_ageing": """
-        SELECT ageing_bucket, count(*) AS payments, sum(amount_to_pay) AS amount_usd
-        FROM gold.fact_pending_payment GROUP BY ALL""",
+    "receivable_ageing": f"""
+        SELECT {AGEING_BUCKET} AS ageing_bucket, count(*) AS payments, sum(amount_to_pay) AS amount_usd
+        FROM gold.fact_pending_payment WHERE currency = 'USD' GROUP BY ALL""",
     "receivable_by_due_month": """
         SELECT date_trunc('MONTH', due_date) AS due_month, sum(amount_to_pay) AS amount_usd
-        FROM gold.fact_pending_payment WHERE due_date IS NOT NULL GROUP BY ALL""",
+        FROM gold.fact_pending_payment WHERE due_date IS NOT NULL AND currency = 'USD' GROUP BY ALL""",
     "receivable_top_agencies": """
         SELECT a.agency_name, count(*) AS payments, sum(p.amount_to_pay) AS amount_usd,
-               sum(CASE WHEN p.days_overdue > 0 THEN p.amount_to_pay END) AS overdue_usd, max(p.days_overdue) AS max_days_overdue
+               sum(CASE WHEN p.due_date < current_date() THEN p.amount_to_pay END) AS overdue_usd,
+               max(CASE WHEN p.due_date < current_date() THEN datediff(current_date(), p.due_date) END)
+                 AS max_days_overdue
         FROM gold.fact_pending_payment p JOIN gold.dim_agency a ON a.agency_key = p.agency_key
+        WHERE p.currency = 'USD'
         GROUP BY ALL ORDER BY amount_usd DESC LIMIT 20""",
     "payments_by_kind": """
         SELECT payment_kind, coalesce(payment_system, 'not given') AS payment_system, count(*) AS payments,
-               sum(amount) AS amount
-        FROM gold.fact_booking_payment GROUP BY ALL""",
+               sum(amount) AS amount_usd
+        FROM gold.fact_booking_payment WHERE currency = 'USD' GROUP BY ALL""",
     # ---------------- page: Ideas, hotels and checkouts ----------------
     "idea_kpis": """
         SELECT (SELECT count(*) FROM gold.dim_travel_idea WHERE active) AS active_ideas,
@@ -99,13 +118,15 @@ DATASETS = {
                (SELECT count(*) FROM gold.dim_accommodation WHERE has_datasheet) AS hotels_with_datasheet,
                (SELECT avg(CAST(is_converted AS INT)) FROM gold.fact_purchase_attempt) AS checkout_conversion""",
     "top_ideas": """
-        SELECT i.title, i.trip_type, count(*) AS bookings, sum(f.total_price) AS revenue_usd
+        SELECT i.title, i.trip_type, count(*) AS bookings,
+               sum(CASE WHEN f.currency = 'USD' THEN f.total_price END) AS revenue_usd
         FROM gold.fact_booking f JOIN gold.dim_travel_idea i ON i.idea_key = f.idea_key
         WHERE f.is_active AND f.idea_key <> '-1'
         GROUP BY ALL ORDER BY bookings DESC LIMIT 15""",
     "top_hotels": """
         SELECT accommodation_name, accommodation_category, accommodation_chain, round(accommodation_rating, 1) AS rating,
-               destination_name, count(DISTINCT booking_ref) AS bookings, sum(sale_amount) AS sale_usd
+               destination_name, count(DISTINCT booking_ref) AS bookings,
+               sum(CASE WHEN sale_currency = 'USD' THEN sale_amount END) AS sale_usd
         FROM gold.obt_booking_service
         WHERE is_active AND booking_is_active AND accommodation_key <> '-1'
         GROUP BY ALL ORDER BY bookings DESC LIMIT 20""",
@@ -129,12 +150,12 @@ DATASETS = {
         SELECT timestampdiff(MINUTE, (SELECT max(finished_at) FROM ops.ingest_runs
                                       WHERE entity = 'bookings' AND status = 'SUCCESS'), current_timestamp())
                  AS minutes_since_extract,
-               timestampdiff(MINUTE, (SELECT max(synced_at) FROM ops.bc_sync), current_timestamp())
+               timestampdiff(MINUTE, (SELECT max(synced_at) FROM ops.business_central_sync), current_timestamp())
                  AS minutes_since_push,
                (SELECT max_by(failed_rows, checked_at) FROM ops.dq_results
                 WHERE check_name = 'e2e_sales_waiting_for_push') AS sales_waiting_for_push""",
     # latest result of every check that ran in the last day: pipeline expectations (severity expect), gold_ and
-    # e2e_ checks of data_quality, bc_ checks of bc_tables (which skips unchanged runs, so its latest results can
+    # e2e_ checks of check_data_quality, business_central_ checks of build_business_central_tables (which skips unchanged runs, so its latest results can
     # come from an earlier run)
     "dq_latest": """
         SELECT check_name, severity, failed_rows, sample, checked_at, run_id FROM (
@@ -148,10 +169,10 @@ DATASETS = {
         FROM ops.pipeline_event_log WHERE event_type = 'update_progress'
           AND timestamp >= timestampadd(DAY, -7, current_timestamp())
         GROUP BY ALL""",
-    "bc_sync_daily": """
+    "business_central_sync_daily": """
         SELECT date_trunc('DAY', synced_at) AS day, result, count(*) AS documents
-        FROM ops.bc_sync GROUP BY ALL""",
-    "bc_held": """
+        FROM ops.business_central_sync GROUP BY ALL""",
+    "business_central_held": """
         SELECT 'sales invoice' AS document, hold_reason, count(*) AS documents
         FROM business_central.sales_invoices WHERE hold_reason IS NOT NULL GROUP BY ALL
         UNION ALL
@@ -322,7 +343,8 @@ PAGES = [
                 [
                     "## Bookings and revenue\n",
                     "Source: gold.fact_booking, gold.dim_date, gold.dim_agency, gold.obt_booking_service. "
-                    "Active = status BOOKED or RQ. All bookings are priced in USD.\n",
+                    "Active = status BOOKED or RQ. Bookings are priced in USD except a handful in EUR; amounts (USD) "
+                    "sum the USD bookings only, counts include every currency.\n",
                 ],
                 (0, 0, 6, 2),
             ),
@@ -381,8 +403,9 @@ PAGES = [
                 "t_suppliers",
                 [
                     "## Suppliers and cost\n",
-                    "Source: gold.obt_booking_service. Cost is shown in the booking currency (USD), "
-                    "converted by Travel Compositor. Active services of active bookings only.\n",
+                    "Source: gold.obt_booking_service. Cost is shown in the booking currency, converted by Travel "
+                    "Compositor; amounts (USD) sum services of USD bookings only. Active services of active bookings "
+                    "only.\n",
                 ],
                 (0, 0, 6, 2),
             ),
@@ -443,7 +466,8 @@ PAGES = [
                 [
                     "## Payments due\n",
                     "Source: gold.fact_pending_payment (latest pending-payments snapshot of Travel Compositor), "
-                    "gold.fact_booking_payment, gold.dim_agency. Days overdue count from the deferred limit date.\n",
+                    "gold.fact_booking_payment, gold.dim_agency. Days overdue count from the deferred limit date "
+                    "(due_date) to today. Amounts (USD) sum USD payments only.\n",
                 ],
                 (0, 0, 6, 2),
             ),
@@ -478,8 +502,8 @@ PAGES = [
                 "b_payment_kind",
                 "payments_by_kind",
                 "payment_kind",
-                "amount",
-                "Payments recorded on bookings, by kind and payment system",
+                "amount_usd",
+                "Payments recorded on bookings, by kind and payment system (USD)",
                 (0, 22, 6, 7),
                 color="payment_system",
             ),
@@ -553,9 +577,9 @@ PAGES = [
                 "t_ops",
                 [
                     "## Pipeline operations\n",
-                    "Source: ops.ingest_runs, ops.pipeline_event_log, ops.dq_results, ops.publish, ops.bc_sync, "
-                    "business_central.*. Job vio_travel_pipeline runs every 30 minutes, at minute 05 and 35, and "
-                    "triggers the pipeline vio_travel_lakehouse; local/push_to_bc.py pushes within 5 minutes after "
+                    "Source: ops.ingest_runs, ops.pipeline_event_log, ops.dq_results, ops.publish, ops.business_central_sync, "
+                    "business_central.*. Job vio_travel_ingest_transform_publish runs every 30 minutes, at minute 05 and 35, and "
+                    "triggers the pipeline vio_travel_build_bronze_silver_gold; local/push_to_business_central.py pushes within 5 minutes after "
                     "each finished run.\n",
                 ],
                 (0, 0, 6, 2),
@@ -580,7 +604,7 @@ PAGES = [
                 "pipeline_updates",
                 "started_at",
                 "seconds",
-                "Pipeline vio_travel_lakehouse updates, duration in seconds (last 7 days)",
+                "Pipeline vio_travel_build_bronze_silver_gold updates, duration in seconds (last 7 days)",
                 (0, 12, 6, 7),
                 color="state",
                 temporal=True,
@@ -594,7 +618,7 @@ PAGES = [
             ),
             bar(
                 "b_sync",
-                "bc_sync_daily",
+                "business_central_sync_daily",
                 "day",
                 "documents",
                 "Documents pushed into Business Central per day",
@@ -604,7 +628,7 @@ PAGES = [
             ),
             bar(
                 "b_held",
-                "bc_held",
+                "business_central_held",
                 "hold_reason",
                 "documents",
                 "Documents held, by reason",

@@ -12,7 +12,7 @@ variables:
     description: Unity Catalog catalog that holds every layer of this platform
     default: vio_travel
   warehouse_id:
-    description: SQL warehouse used by the dashboard, the Genie space and local/push_to_bc.py
+    description: SQL warehouse used by the dashboard, the Genie space and local/push_to_business_central.py
     default: 59d2b145a89ef5c1
   pipeline_sp:
     description: >-

@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-import plan_backfill as m  # noqa: E402
+import plan_backfill_windows as m  # noqa: E402
 
 
 def test_month_windows_cover_range_without_gaps():

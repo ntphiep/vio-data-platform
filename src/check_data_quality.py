@@ -1,10 +1,10 @@
-"""Task data_quality - the last task of every job run, catalog <catalog>. Writes ops.dq_results.
+"""Task check_data_quality - the last task of every job run, catalog <catalog>. Writes ops.dq_results.
 
 Four kinds of checks meet in one table, so the dashboard and the SQL alert read one place:
-- expectations of the pipeline vio_travel_lakehouse (bronze_, silver_ rows dropped or warned), copied from the
+- expectations of the pipeline vio_travel_build_bronze_silver_gold (bronze_, silver_ rows dropped or warned), copied from the
   pipeline event log ops.pipeline_event_log for the latest update, severity `expect`;
 - gold_ checks that a row-level expectation cannot express: key uniqueness, orphans, totals against silver;
-- bc_ checks stay in bc_tables, which blocks the publish of business_central;
+- bc_ checks stay in build_business_central_tables, which blocks the publish of business_central;
 - e2e_ checks of whether each stage is up to date with the one before it:
 
     Travel Compositor API -> ops.ingest_runs -> pipeline (bronze, silver, gold) -> business_central -> Business Central
@@ -16,7 +16,7 @@ The SQL alert pipeline_freshness covers the case where the job itself stops runn
 import argparse
 import json
 
-# same result groups as local/push_to_bc.py: a document is done when its latest attempt is terminal for its hash
+# same result groups as local/push_to_business_central.py: a document is done when its latest attempt is terminal for its hash
 TERMINAL = (
     "('CREATED', 'UPDATED', 'RECREATED', 'CANCELLED_DRAFT_EMPTIED', 'NEEDS_CREDIT_MEMO', 'NOTHING_TO_CANCEL', "
     "'NO_EXCHANGE_RATE', 'REMOVED_DRAFT_EMPTIED', 'REMOVED_POSTED', 'REMOVED_NOT_FOUND')"
@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--pipeline_stale_minutes", type=int, default=75, help="the job runs every 30 min")
     ap.add_argument("--push_stale_minutes", type=int, default=120)
     ap.add_argument("--push_scope_days", type=int, default=30, help="same as scope_sql in local/config.json")
+    ap.add_argument("--ops_retention_days", type=int, default=180, help="ops.api_calls and ops.dq_results")
     a = ap.parse_args()
     spark = SparkSession.builder.getOrCreate()
     c = a.catalog
@@ -66,14 +67,14 @@ def main():
         else f"(SELECT * FROM {c}.business_central.sales_invoices WHERE false)"
     )
     # Sales documents of the last publish that the push has not delivered yet: the same rule and the same scope as
-    # local/push_to_bc.py (latest attempt per key, terminal for the current hash; at most MAX_FAILURES failures).
+    # local/push_to_business_central.py (latest attempt per key, terminal for the current hash; at most MAX_FAILURES failures).
     pending_sales = f"""(SELECT i.external_document_number AS k FROM {sales} i
         LEFT JOIN (SELECT doc_key,
                           max_by(payload_hash, synced_at) FILTER (WHERE result IN {ATTEMPT}) AS h,
                           max_by(result, synced_at) FILTER (WHERE result IN {ATTEMPT}) AS r
-                   FROM {c}.ops.bc_sync WHERE doc_type = 'sales' AND bc_company = '{company}' GROUP BY doc_key) s
+                   FROM {c}.ops.business_central_sync WHERE doc_type = 'sales' AND bc_company = '{company}' GROUP BY doc_key) s
           ON s.doc_key = i.external_document_number
-        LEFT ANTI JOIN (SELECT doc_key, payload_hash FROM {c}.ops.bc_sync
+        LEFT ANTI JOIN (SELECT doc_key, payload_hash FROM {c}.ops.business_central_sync
                         WHERE doc_type = 'sales' AND result = 'FAILED' AND bc_company = '{company}'
                         GROUP BY ALL HAVING count(*) >= {MAX_FAILURES}) d
           ON d.doc_key = i.external_document_number AND d.payload_hash = i.payload_hash
@@ -127,11 +128,11 @@ def main():
                OR coalesce(last_ok, TIMESTAMP'1970-01-01')
                   < current_timestamp() - make_interval(0, 0, 0, 0, 0, {a.pipeline_stale_minutes})""",
         ),
-        # stage 3: silver -> business_central. bc_tables records a token on every run; silver changed after it.
+        # stage 3: silver -> business_central. build_business_central_tables records a token on every run; silver changed after it.
         "e2e_business_central_behind_silver": (
             "alert",
             f"""SELECT 'business_central' AS k FROM (SELECT 1)
-            WHERE coalesce((SELECT max(built_at) FROM {c}.ops.build_state WHERE task = 'bc_tables'),
+            WHERE coalesce((SELECT max(built_at) FROM {c}.ops.build_state WHERE task = 'build_business_central_tables'),
                            TIMESTAMP'1970-01-01')
                 < TIMESTAMP'{silver_changed_at}'""",
         ),
@@ -221,7 +222,7 @@ def main():
         ),
         "gold_payment_overdue_90_days": (
             "warn",
-            f"SELECT booking_ref AS k FROM {g}.fact_pending_payment WHERE days_overdue > 90",
+            f"SELECT booking_ref AS k FROM {g}.fact_pending_payment WHERE due_date < date_sub(current_date(), 90)",
         ),
         # bookings are read by update date, so a payment can point at a booking that was never in a read window
         "gold_pending_payment_booking_not_loaded": (
@@ -240,9 +241,9 @@ def main():
         # stage 4: business_central -> Business Central. Documents wait while the push has not run for too long.
         "e2e_push_stalled": (
             "alert",
-            f"""SELECT 'ops.bc_sync' AS k FROM (SELECT 1)
+            f"""SELECT 'ops.business_central_sync' AS k FROM (SELECT 1)
             WHERE EXISTS (SELECT 1 FROM {pending_sales})
-              AND coalesce((SELECT max(synced_at) FROM {c}.ops.bc_sync WHERE bc_company = '{company}'),
+              AND coalesce((SELECT max(synced_at) FROM {c}.ops.business_central_sync WHERE bc_company = '{company}'),
                            TIMESTAMP'1970-01-01')
                   < current_timestamp() - make_interval(0, 0, 0, 0, 0, {a.push_stale_minutes})""",
         ),
@@ -253,7 +254,7 @@ def main():
         run_id STRING, checked_at TIMESTAMP, check_name STRING, severity STRING, failed_rows BIGINT, sample STRING)""")
     sql(f"""CREATE TABLE IF NOT EXISTS {c}.ops.build_state (
         task STRING, run_id STRING, built_at TIMESTAMP, silver_token STRING)""")
-    sql(f"""CREATE TABLE IF NOT EXISTS {c}.ops.bc_sync (synced_at TIMESTAMP, doc_type STRING, doc_key STRING,
+    sql(f"""CREATE TABLE IF NOT EXISTS {c}.ops.business_central_sync (synced_at TIMESTAMP, doc_type STRING, doc_key STRING,
              payload_hash STRING, bc_company STRING, bc_id STRING, bc_number STRING, result STRING, error STRING)""")
     rows_out, alerts = [], []
     for name, (severity, q) in checks.items():
@@ -286,6 +287,13 @@ def main():
     ).selectExpr(
         "run_id", "current_timestamp() AS checked_at", "check_name", "severity", "failed_rows", "sample"
     ).write.mode("append").saveAsTable(f"{c}.ops.dq_results")
+    # retention of the two run logs that grow every run; ingest_runs, publish and business_central_sync are kept as audit trail
+    sql(
+        f"DELETE FROM {c}.ops.api_calls WHERE called_at < current_timestamp() - make_interval(0, 0, 0, {a.ops_retention_days})"
+    )
+    sql(
+        f"DELETE FROM {c}.ops.dq_results WHERE checked_at < current_timestamp() - make_interval(0, 0, 0, {a.ops_retention_days})"
+    )
     if alerts:
         raise RuntimeError(f"data-quality alert: {alerts}")
 

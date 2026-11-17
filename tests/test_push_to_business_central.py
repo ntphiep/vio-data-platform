@@ -12,9 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "local"))
 sys.path.insert(0, str(ROOT / "src"))
 import extend_number_series as ns  # noqa: E402
-import push_to_bc as m  # noqa: E402
+import push_to_business_central as m  # noqa: E402
 
-import bc_tables  # noqa: E402
+import build_business_central_tables  # noqa: E402
 
 
 class Resp:
@@ -321,7 +321,7 @@ def test_plan_skips_done_bookings_before_the_limit_so_new_ones_are_not_starved()
 def test_scope_includes_bookings_changed_recently_and_the_column_exists():
     scope = m.load_cfg()["scope_sql"]
     assert "i.last_update_at" in scope and " OR " in scope
-    src = (ROOT / "src" / "bc_tables.py").read_text()
+    src = (ROOT / "src" / "build_business_central_tables.py").read_text()
     sales_invoices = src[src.index("CREATE OR REPLACE TABLE {b}.sales_invoices") :]
     assert "b.last_update_at" in sales_invoices[: sales_invoices.index("FROM booking_customer")]
 
@@ -502,26 +502,26 @@ def test_number_series_refuses_when_lines_cannot_be_read(monkeypatch):
     assert applied == []
 
 
-# ------------------------------------------------------------------ bc_tables (findings 12, 14)
+# ------------------------------------------------------------------ build_business_central_tables (findings 12, 14)
 def test_provider_vendor_number_keeps_lowercase_letters():
-    assert "regexp_replace(upper(s.provider), '[^A-Z0-9]', '')" in bc_tables.PROVIDER_VENDOR_NUMBER
-    src = (ROOT / "src" / "bc_tables.py").read_text()
+    assert "regexp_replace(upper(s.provider), '[^A-Z0-9]', '')" in build_business_central_tables.PROVIDER_VENDOR_NUMBER
+    src = (ROOT / "src" / "build_business_central_tables.py").read_text()
     assert "{PROVIDER_VENDOR_NUMBER}" in src and "regexp_replace(s.provider," not in src
 
 
 def test_every_service_type_has_its_own_type_code():
-    codes = bc_tables.TYPE_CODES
+    codes = build_business_central_tables.TYPE_CODES
     assert len(set(codes.values())) == len(codes)
     assert codes["manual_transfer"] == "MTR" and codes["manual_transport"] == "MTP"
-    assert all(k in codes for k in bc_tables.SERVICE_ARRAYS)
-    case = bc_tables.type_code_sql()
+    assert all(k in codes for k in build_business_central_tables.SERVICE_ARRAYS)
+    case = build_business_central_tables.type_code_sql()
     assert "WHEN 'manual_transport' THEN 'MTP'" in case and "WHEN 'manual_transfer' THEN 'MTR'" in case
 
 
 def test_data_quality_uses_the_push_result_groups():
     import ast
 
-    import data_quality as dq
+    import check_data_quality as dq
 
     assert set(ast.literal_eval(dq.TERMINAL)) == set(m.TERMINAL)
     assert set(ast.literal_eval(dq.ATTEMPT)) == set(m.ATTEMPT)

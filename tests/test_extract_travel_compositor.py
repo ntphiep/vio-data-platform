@@ -10,7 +10,7 @@ import pytest
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-import ingest_tc as m  # noqa: E402
+import extract_travel_compositor as m  # noqa: E402
 
 
 class Resp:

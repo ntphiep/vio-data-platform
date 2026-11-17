@@ -1,4 +1,4 @@
--- Lab seed for the mapping tables created by src/bronze_silver.py.
+-- Lab seed for the mapping tables created by sql/setup-catalog.sql (and again by src/build_business_central_tables.py if missing).
 -- These rows are NOT approved by Vio Travel Finance. They only let the lab push a few real bookings.
 -- In production, Finance owns ref.customer_map and ref.vendor_map (YVS spec API_Sales_T01 row 18,
 -- API_Purchases_T01 row 19: an unmapped customer or supplier is held, never sent).

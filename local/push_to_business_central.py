@@ -6,7 +6,7 @@ A Databricks job cannot do an interactive login, and an app registration needs a
 Flow per run
 1. Read the last row of <catalog>.ops.publish and read every business_central table AS OF those versions, so
    the run sees one consistent build that passed the blocking data-quality checks.
-2. Read the sync state of every document key from ops.bc_sync: the hash and result of the latest attempt, the
+2. Read the sync state of every document key from ops.business_central_sync: the hash and result of the latest attempt, the
    latest logged row, and the failures since the latest terminal result. A document is sent when its current
    payload_hash differs from the hash of its latest attempt, or the latest attempt failed. Terminal results
    (TERMINAL) are not retried while the hash is unchanged. Transient results (TRANSIENT) are retried until
@@ -25,14 +25,14 @@ Flow per run
 7. A document synced before that is no longer in the published tables (booking left BOOKED/RQ/CANCELED, service
    cost dropped to 0, key changed) has its draft emptied (REMOVED_DRAFT_EMPTIED); a posted one is only recorded
    (REMOVED_POSTED). More than max_removals_per_run such documents stop the removal step for a human check.
-8. Write the result rows into ops.bc_sync after every booking, so a crash loses at most one booking's rows; a
+8. Write the result rows into ops.business_central_sync after every booking, so a crash loses at most one booking's rows; a
    document created but not recorded is found again by its key on the next run and updated, not duplicated.
 
 Timer mode (--on-new-run, used by the systemd timer every 5 minutes): the run asks the Jobs API, which needs no
-SQL warehouse, whether job vio_travel_pipeline finished a run since the last push, and exits at once when it did
+SQL warehouse, whether job vio_travel_ingest_transform_publish finished a run since the last push, and exits at once when it did
 not and the last push left nothing behind. State lives in .push_state.json next to this file.
 
-Usage: uv run --no-project --with databricks-sdk --with requests push_to_bc.py [--limit N] [--dry-run] [--on-new-run]
+Usage: uv run --no-project --with databricks-sdk --with requests push_to_business_central.py [--limit N] [--dry-run] [--on-new-run]
 Config: config.json next to this file. The systemd unit wraps the run in flock, so two runs never overlap.
 """
 
@@ -556,7 +556,7 @@ REMOVED_RESULT = {
 def remove_document(bc, kind, key):
     """A document synced before that is no longer in the published tables: empty its draft (never delete it,
     see push_document), only record a posted one. The purchase key is also the vendorInvoiceNumber
-    (src/bc_tables.py builds both from service_id and type_code)."""
+    (src/build_business_central_tables.py builds both from service_id and type_code)."""
     key_field = "externalDocumentNumber" if kind == "sales" else "vendorInvoiceNumber"
     result, rec = push_document(bc, kind, key_field, key, None, [], cancel=True)
     return REMOVED_RESULT.get(result, result), rec
@@ -636,7 +636,7 @@ def plan(sales, purchases, limit, retry=frozenset()):
 
 
 def state_sql(c, company):
-    """CTEs over ops.bc_sync. st: per document key, the hash and result of the latest attempt (ATTEMPT), the
+    """CTEs over ops.business_central_sync. st: per document key, the hash and result of the latest attempt (ATTEMPT), the
     latest row of any result, and whether a document may exist in Business Central. fl: per key and hash,
     the transient results since the latest terminal one."""
     return f"""WITH st AS (
@@ -648,11 +648,11 @@ def state_sql(c, company):
                max_by(result, synced_at) AS log_result,
                max_by(error, synced_at) AS log_error,
                bool_or(result IN {sql_list(EVER_SENT)}) AS ever_sent
-        FROM {c}.ops.bc_sync WHERE bc_company = {company} AND doc_type IN ('sales', 'purchase')
+        FROM {c}.ops.business_central_sync WHERE bc_company = {company} AND doc_type IN ('sales', 'purchase')
         GROUP BY doc_type, doc_key),
       fl AS (
         SELECT f.doc_type, f.doc_key, f.payload_hash, count(*) AS failures
-        FROM {c}.ops.bc_sync f JOIN st ON st.doc_type = f.doc_type AND st.doc_key = f.doc_key
+        FROM {c}.ops.business_central_sync f JOIN st ON st.doc_type = f.doc_type AND st.doc_key = f.doc_key
         WHERE f.bc_company = {company} AND f.result IN {sql_list(TRANSIENT)}
           AND (st.terminal_at IS NULL OR f.synced_at > st.terminal_at)
         GROUP BY f.doc_type, f.doc_key, f.payload_hash)
@@ -726,7 +726,7 @@ def main():
         return
     g = {t: f"{c}.business_central.{t} VERSION AS OF {v}" for t, v in ver.items()}
     print(f"reading business_central published by run {pub[0]['run_id']}: {ver}")
-    db.q(f"""CREATE TABLE IF NOT EXISTS {c}.ops.bc_sync (synced_at TIMESTAMP, doc_type STRING, doc_key STRING,
+    db.q(f"""CREATE TABLE IF NOT EXISTS {c}.ops.business_central_sync (synced_at TIMESTAMP, doc_type STRING, doc_key STRING,
              payload_hash STRING, bc_company STRING, bc_id STRING, bc_number STRING, result STRING, error STRING)""")
     company = lit(cfg["bc_company"])
     scope = a.scope_sql or cfg.get("scope_sql", "TRUE")
@@ -743,7 +743,7 @@ def main():
 
     def party_synced(kind):
         # latest synced hash per party, so a party that returns to an earlier state is upserted again
-        return f"""(SELECT doc_key, max_by(payload_hash, synced_at) AS payload_hash FROM {c}.ops.bc_sync
+        return f"""(SELECT doc_key, max_by(payload_hash, synced_at) AS payload_hash FROM {c}.ops.business_central_sync
                     WHERE doc_type = '{kind}' AND result IN ('CREATED', 'UPDATED', 'UNCHANGED', 'UPSERTED')
                       AND bc_company = {company} GROUP BY doc_key)"""
 
@@ -788,7 +788,7 @@ def main():
 
     def flush():
         if results:
-            db.q(f"INSERT INTO {c}.ops.bc_sync VALUES " + ",".join(results))
+            db.q(f"INSERT INTO {c}.ops.business_central_sync VALUES " + ",".join(results))
             results.clear()
 
     try:
@@ -912,7 +912,7 @@ def main():
         if job_run is not None:
             # more bookings waiting than this run took: the next timer tick continues without a new job run
             STATE.write_text(json.dumps({"last_job_run": job_run, "backlog": pending > len(todo)}))
-    print(f"done: results written to {c}.ops.bc_sync, {failed_total} failed")
+    print(f"done: results written to {c}.ops.business_central_sync, {failed_total} failed")
     sys.exit(1 if failed_total else 0)
 
 

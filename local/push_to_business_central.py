@@ -462,7 +462,10 @@ class BC:
                         f"configuration package {code} {action}: {st.get(field)}, errors {st.get('numberOfErrors')}"
                     )
         finally:
-            self.call("DELETE", f"{auto}/configurationPackages({pid})", headers={"If-Match": "*"})
+            # a package left behind holds a copy of the rates and shows in Configuration Packages; report it
+            gone = self.call("DELETE", f"{auto}/configurationPackages({pid})", headers={"If-Match": "*"})
+            if gone.status_code >= 300:
+                print(f"configuration package {code} not deleted: HTTP {gone.status_code}; delete it by hand")
 
 
 def tc_implied_rates(db, cfg, pairs, window_days=30, min_services=3):

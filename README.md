@@ -214,7 +214,7 @@ sends only the fields of the standard API v2.0 until YVS publishes its endpoints
 Data the specifications ask for that Travel Compositor does not hold, so Vio or YVS must provide it: agent currency
 and its exchange rate, business unit per user, supplier payment terms, vendor invoice numbers, item per service type,
 TCODE (credit or refund reason), invoice number series, payment requests, and approved customer and vendor mappings
-(today 7,241 sales invoices wait as `CUSTOMER_UNMAPPED` and 23,656 purchase invoices as `VENDOR_UNMAPPED`).
+(today 7,261 sales invoices wait as `CUSTOMER_UNMAPPED` and 23,088 purchase invoices as `VENDOR_UNMAPPED`).
 
 ## Orchestration
 

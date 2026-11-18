@@ -1,10 +1,11 @@
 resources:
   jobs:
-    # Tags, masks on history tables, grants and metric views. Runs as the deploying user (catalog owner), who may
-    # change tags and grants; run it after each deploy, and it re-applies itself weekly.
+    # Everything the pipeline cannot declare: masking function, tags, masks, grants, comments, views and anomaly
+    # detection. Runs as the deploying user (catalog owner), who may change tags and grants; run it after each
+    # deploy, and it re-applies itself weekly.
     vio_travel_apply_governance:
       name: vio_travel_apply_governance
-      description: Unity Catalog tags, column masks, grants and the metric views of catalog ${var.catalog}.
+      description: Masking function, Unity Catalog tags, column masks, grants, comments, plain views, metric views and anomaly detection of catalog ${var.catalog}.
       max_concurrent_runs: 1
       schedule:
         quartz_cron_expression: "0 45 3 ? * SUN"

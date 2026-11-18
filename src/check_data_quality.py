@@ -4,7 +4,7 @@ Four kinds of checks meet in one table, so the dashboard and the SQL alert read 
 - expectations of the pipeline vio_travel_build_bronze_silver_gold (bronze_, silver_ rows dropped or warned), copied from the
   pipeline event log ops.pipeline_event_log for the latest update, severity `expect`;
 - gold_ checks that a row-level expectation cannot express: key uniqueness, orphans, totals against silver;
-- bc_ checks stay in build_business_central_tables, which blocks the publish of business_central;
+- business_central_ checks stay in build_business_central_tables, which blocks the publish of business_central;
 - e2e_ checks of whether each stage is up to date with the one before it:
 
     Travel Compositor API -> ops.ingest_runs -> pipeline (bronze, silver, gold) -> business_central -> Business Central

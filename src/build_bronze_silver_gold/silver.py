@@ -147,7 +147,7 @@ BOOKING_COLUMNS = [
     "r AS payload",
     "run_id",
     "source_file",
-    # added for the Business Central specification of YVS; new columns go last, where Delta appends them
+    # added for the Business Central specification of the implementation partner; new columns go last, where Delta appends them
     "r:pricebreakdown.agencyManagementFee.microsite.amount::decimal(18,2) AS agency_management_fee",
     "coalesce(nullif(trim(r:bookingAssociatedTo::string), ''), r:bookingReference::string) AS main_booking_ref",
     "nullif(trim(r:referralId::string), '') AS referral_id",
@@ -371,7 +371,7 @@ def _explode_services(cols: str) -> str:
             "last_update_at": "Last update time of the booking.",
             "supplier_confirmation": "Confirmation number the supplier gave (service bookingReference).",
             "cancellation_date": "Day the service was cancelled (cancelationDate); NULL when not cancelled.",
-            "exchange_rate_microsite": "Travel Compositor exchangeRateMicrosite of the service price; YVS maps it to the Currency Factor.",
+            "exchange_rate_microsite": "Travel Compositor exchangeRateMicrosite of the service price; the implementation partner maps it to the Currency Factor.",
             "amendment_count": "Number of amendments of the service; details in silver.booking_service_amendments.",
         },
     ),

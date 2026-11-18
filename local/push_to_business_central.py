@@ -723,10 +723,6 @@ def main():
         print("no published business_central build yet")
         return
     ver = json.loads(pub[0]["versions"])
-    if any(t.startswith("bc_") for t in ver):
-        # rows written before the tables moved from gold.bc_* to business_central.*
-        print("the last publish uses the old gold.bc_* layout; wait for the next job run")
-        return
     g = {t: f"{c}.business_central.{t} VERSION AS OF {v}" for t, v in ver.items()}
     print(f"reading business_central published by run {pub[0]['run_id']}: {ver}")
     db.q(f"""CREATE TABLE IF NOT EXISTS {c}.ops.business_central_sync (synced_at TIMESTAMP, doc_type STRING, doc_key STRING,

@@ -164,7 +164,7 @@ def main():
         FROM {c}.ref.customer_map m
         WHERE m.bc_customer_no NOT IN (SELECT 'AG' || agency_id FROM {c}.silver.agencies)""")
     # Documents are created for BOOKED and RQ; CANCELED only updates what was sent before
-    # (YVS spec API_Sales_T01 row 6).
+    # (implementation partner spec API_Sales_T01 row 6).
     sql(f"""CREATE OR REPLACE TEMP VIEW booking_customer AS
         SELECT b.*, lower(trim(b.payload:agencyBookingReference::string)) AS agency_reference_key,
                CASE WHEN u.agency_id IS NULL THEN 'AG' || b.agency_id ELSE m.bc_customer_no END AS customer_number,
@@ -192,8 +192,8 @@ def main():
                b.agency_id, b.payload:agencyBookingReference::string AS agency_reference,
                to_date(b.created_at) AS invoice_date, b.start_date AS service_start_date, b.currency AS currency_code,
                b.total_price, coalesce(l.lines_total, 0) AS lines_total, l.line_currencies, b.last_update_at,
-               -- fields of the YVS sales specification (API_Sales_T01) that Travel Compositor provides; the
-               -- push does not send them yet, they wait for the YVS endpoints and dimensions
+               -- fields of the partner sales specification (API_Sales_T01) that Travel Compositor provides; the
+               -- push does not send them yet, they wait for the partner endpoints and dimensions
                b.main_booking_ref, b.referral_id AS your_reference, b.sales_channel, b.microsite, b.trip_type,
                b.end_date AS service_end_date, b.pax, b.username AS salesperson_username, b.agency_management_fee,
                b.paid_amount AS deposit_amount, b.deferred_amount AS balance_amount,
@@ -212,7 +212,7 @@ def main():
                           min_by(destination_country, start_date) AS destination_country
                    FROM {c}.silver.booking_services GROUP BY booking_ref) sv ON sv.booking_ref = b.booking_ref
         WHERE b.doc_action = 'CANCEL' OR l.booking_ref IS NOT NULL""")
-    # Purchases: one invoice per service (YVS spec API_Purchases_T01 row 5). Vendor: Travel Compositor
+    # Purchases: one invoice per service (implementation partner spec API_Purchases_T01 row 5). Vendor: Travel Compositor
     # supplier ID; for API services without one, the provider code; for manual services, ref.vendor_map.
     sql(f"""CREATE OR REPLACE TEMP VIEW service_vendor AS
         SELECT s.*, b.created_at AS booking_created_at,
@@ -239,7 +239,7 @@ def main():
                is_manual, vendor_number, hold_reason, status, supplier_id, provider, supplier_name,
                cost_currency AS currency_code, service_id || '-' || type_code AS vendor_invoice_number,
                provider_reference AS vendor_order_number, to_date(booking_created_at) AS invoice_date,
-               -- fields of the YVS purchase specification (API_Purchases_T01), not sent by the push yet
+               -- fields of the partner purchase specification (API_Purchases_T01), not sent by the push yet
                supplier_confirmation, cancellation_date, exchange_rate_microsite AS currency_factor,
                amendment_count, start_date AS service_start_date, end_date AS service_end_date,
                cost_amount AS lines_total,

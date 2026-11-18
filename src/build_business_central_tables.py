@@ -7,7 +7,7 @@ ops.publish           write-audit-publish: table versions are published only whe
                       local/push_to_business_central.py reads the tables AS OF the last published versions, so it never sees a
                       half-written or failed build, and header and line tables always match.
 
-Check names start with the layer they test (silver_, bronze_, bc_). End-to-end freshness checks run in the last
+Check names start with the layer they test (silver_, bronze_, business_central_). End-to-end freshness checks run in the last
 task, check_data_quality.py. The task skips the rebuild when silver and ref have not changed since the last publish
 (content token in ops.build_state, recorded on every run); job parameter rebuild=true forces it.
 """
@@ -271,6 +271,10 @@ def main():
         sql(f"COMMENT ON TABLE {b}.{t} IS '{text}'")
     for t in PII_TABLES:
         sql(f"ALTER TABLE {b}.{t} SET TAGS ('contains_pii' = 'true')")
+    # The push reads the last published version; while blocking checks keep failing that version ages, so its data
+    # files are kept 30 days instead of the default 7 before VACUUM may remove them.
+    for t in TABLES:
+        sql(f"ALTER TABLE {b}.{t} SET TBLPROPERTIES ('delta.deletedFileRetentionDuration' = 'interval 30 days')")
 
     # ---------------- audit: data quality -------------------------------------------------------
     sql(f"""CREATE TABLE IF NOT EXISTS {c}.ops.dq_results (

@@ -20,6 +20,9 @@ Idempotent; runs after each deploy and weekly, so tags, table comments and grant
   Edition metastore holds 500 tables.
 - Metric views: gold.booking_metrics, gold.service_metrics, gold.receivable_metrics (YAML, version 1.1), the
   definitions Genie and the dashboard share.
+- Anomaly detection: a data quality monitor on the schemas silver, gold and business_central (MONITORED_SCHEMAS)
+  checks freshness and completeness of every table; the bundle has no resource type for it, so this job creates
+  the monitors through the data quality API. https://docs.databricks.com/aws/en/data-quality-monitoring/anomaly-detection/
 """
 
 import argparse
@@ -297,6 +300,26 @@ def kind(table: str) -> str:
     return "STREAMING TABLE" if table.startswith(STREAMING) else "MATERIALIZED VIEW"
 
 
+MONITORED_SCHEMAS = ("silver", "gold", "business_central")
+
+
+def ensure_anomaly_detection(catalog: str) -> list[str]:
+    """Create the schema monitor where it is missing; returns the schemas it created a monitor for."""
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.errors import NotFound
+
+    w, created = WorkspaceClient(), []
+    for schema in MONITORED_SCHEMAS:
+        schema_id = w.schemas.get(f"{catalog}.{schema}").schema_id
+        try:
+            w.api_client.do("GET", f"/api/data-quality/v1/monitors/schema/{schema_id}")
+        except NotFound:
+            body = {"object_type": "schema", "object_id": schema_id, "anomaly_detection_config": {}}
+            w.api_client.do("POST", "/api/data-quality/v1/monitors", body=body)
+            created.append(schema)
+    return created
+
+
 def main():
     from pyspark.sql import SparkSession
 
@@ -362,6 +385,11 @@ def main():
         f"GRANT USE SCHEMA, SELECT, READ VOLUME, EXECUTE ON CATALOG {c} TO `{engineer}`",
     ]:
         run(stmt)
+
+    try:
+        done.extend(f"anomaly detection on {s}" for s in ensure_anomaly_detection(c))
+    except Exception as e:  # noqa: BLE001 - reported with the failed statements
+        failed.append(f"anomaly detection -> {str(e).splitlines()[0][:200]}")
 
     print(f"governance: {len(done)} statements applied")
     for f in failed:

@@ -4,9 +4,9 @@ Auto Loader reads the gzip NDJSON pages that extract_travel_compositor lands in 
 and keeps every record whole as VARIANT. A malformed line is kept with doc = NULL and its text in bad_line, so one
 bad line never stops the stream (expectation bronze_record_parsed counts them).
 
-Snapshot entities are clustered by run_id: silver reads one extract run at a time (WHERE run_id = ...), so the
-clustering lets that read skip the files of every other run. The other entities are read as streams or in full and
-keep automatic clustering.
+Snapshot entities are clustered by run_id, because they are read one extract run at a time (WHERE run_id = ...) by
+reconciliation and audit queries; silver reads the same run from its landing files, since a snapshot source may not
+read a table of its own pipeline. The other entities are read as streams and keep automatic clustering.
 
 Bronze is the only full history of what the API returned: landing files are removed after 90 days, so a full
 refresh of the pipeline must not empty these tables (pipelines.reset.allowed = false).

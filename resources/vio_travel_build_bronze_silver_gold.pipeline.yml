@@ -20,7 +20,7 @@ resources:
         # an update started by a job retries itself on retryable errors (default 5 times, each a full update);
         # one retry is enough here and keeps a failing update from using up the daily compute quota
         pipelines.numUpdateRetryAttempts: "1"
-      # the event log as a Unity Catalog table, read by the task check_data_quality and the dashboard page Operations
+      # the event log as a Unity Catalog table, read by the task check_data_quality and the dashboard page Pipeline operations
       event_log:
         catalog: ${var.catalog}
         schema: ops

@@ -280,7 +280,9 @@ def main():
                    'array<struct<name:string,dataset:string,passed_records:bigint,failed_records:bigint>>')) t(x)
             WHERE ev.event_type = 'flow_progress'
             GROUP BY ALL""").collect():
-            rows_out.append((a.run_id, r["name"], "expect", int(r["failed"] or 0), r["dataset"]))
+            # one expectation name is shared by every bronze table, so the table name makes the check unique per run
+            check = f"{r['name']}.{r['dataset'].split('.')[-1]}" if r["name"].startswith("bronze_") else r["name"]
+            rows_out.append((a.run_id, check, "expect", int(r["failed"] or 0), r["dataset"]))
             print(f"DQ expect {r['name']} on {r['dataset']}: failed={r['failed']} passed={r['passed']}")
     spark.createDataFrame(
         rows_out, "run_id STRING, check_name STRING, severity STRING, failed_rows BIGINT, sample STRING"

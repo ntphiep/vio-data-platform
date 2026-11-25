@@ -114,7 +114,9 @@ def notify(title, body):
     """Desktop notification; printed as well, so the journal keeps it."""
     print(f"{title}: {body}")
     try:
-        subprocess.run(["notify-send", "-u", "critical", "-a", "vio-push-business-central", title, body], check=False)
+        # A problem stays on screen until dismissed; the all-clear is transient.
+        urgency = ["-u", "normal", "-e"] if body == "back to normal" else ["-u", "critical"]
+        subprocess.run(["notify-send", *urgency, "-a", "vio-push-business-central", title, body], check=False)
     except OSError:
         pass
 
@@ -139,11 +141,12 @@ def job_problem(runs, now_ms):
     """Dead-man check on the job from its latest runs (newest first, any state): a text, or None when healthy."""
     if not runs:
         return "the job has no run"
-    age = (now_ms - (runs[0].start_time or 0)) / 60000
-    if age > JOB_STALE_MINUTES:
-        return (
-            f"no run of the job started for {age:.0f} minutes (daily quota used up, schedule paused or deploy broken)"
-        )
+    started = runs[0].start_time or 0
+    if (now_ms - started) / 60000 > JOB_STALE_MINUTES:
+        # The text names the last start, not the age, so it stays the same until a new run starts and
+        # notify_on_change raises it once instead of on every tick.
+        since = dt.datetime.fromtimestamp(started / 1000).strftime("%d/%m %H:%M")
+        return f"no run of the job started since {since} (daily quota used up, schedule paused or deploy broken)"
     done = [r for r in runs if r.state and r.state.result_state is not None]
     if len(done) >= JOB_FAILED_RUNS and all(r.state.result_state.value != "SUCCESS" for r in done[:JOB_FAILED_RUNS]):
         return f"the last {JOB_FAILED_RUNS} runs of the job failed: {(done[0].state.state_message or '')[:200]}"

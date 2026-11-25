@@ -544,8 +544,11 @@ def run_(start_min_ago, result=None, message=""):
     return NS(run_id=start_min_ago, start_time=(10_000 - start_min_ago) * 60000, state=state)
 
 
-def test_job_problem_reports_a_stopped_job():
-    assert "no run of the job started" in m.job_problem([run_(200, "SUCCESS")], 10_000 * 60000)
+def test_job_problem_reports_a_stopped_job_with_the_same_text_on_every_tick():
+    runs = [run_(200, "SUCCESS")]
+    first = m.job_problem(runs, 10_000 * 60000)
+    assert "no run of the job started since" in first
+    assert m.job_problem(runs, 10_005 * 60000) == first
 
 
 def test_job_problem_reports_repeated_failures_and_ignores_a_running_run():

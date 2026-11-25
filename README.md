@@ -195,8 +195,8 @@ not an app registration. Each run:
 4. Upserts customers and vendors, and loads missing exchange rates through a RapidStart configuration package.
 5. Creates a draft with its lines in one deep-insert POST, or replaces the header and lines of an existing draft in one
    transactional OData `$batch`. A posted document is never changed and is reported with status `NEEDS_CREDIT_MEMO`. A
-   cancelled booking or service empties its draft so it cannot be posted. Travel Compositor sets the cost of a
-   cancelled service to 0, so the tables keep such a service, and a booking left without lines, as a `CANCEL` row; a
+   cancelled booking or service empties its draft so it cannot be posted. Travel Compositor usually sets the cost of
+   a cancelled service to 0, so the tables keep every cancelled service, and a booking left without lines, as a `CANCEL` row; a
    synced document that disappears from the tables is emptied as well, and more than 50 at once
    (`max_removals_per_run`) stop that step for a person to check. Drafts are never deleted, because deleting a numbered
    draft makes Business Central create an empty posted invoice.

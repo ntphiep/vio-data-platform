@@ -260,7 +260,7 @@ def main():
                                          'd', to_date(booking_created_at))), 256) AS payload_hash
         FROM (SELECT *, {type_code_sql()} AS type_code,
                      coalesce(cost_amount, 0) <> 0 AS has_cost FROM service_vendor)
-        -- Travel Compositor sets the net cost of a cancelled service to 0. Such a service stays as a CANCEL row,
+        -- Travel Compositor usually sets the net cost of a cancelled service to 0. Such a service stays as a CANCEL row,
         -- so the push empties the draft it sent before; one without a cost is kept only when its key is not taken
         -- by a service with a cost and once per key, so blocking check business_central_purchase_key_unique
         -- still tests the services with a cost only.

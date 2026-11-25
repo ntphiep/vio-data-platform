@@ -35,6 +35,7 @@ Central trial. The Travel Compositor API is only read: GET requests and the auth
 | Extract | task `extract_travel_compositor` of job `vio_travel_ingest_transform_publish` | `src/extract_travel_compositor.py` | gzip NDJSON files in volume `raw.landing`, run log in `ops` |
 | Bronze, silver, gold | Lakeflow pipeline `vio_travel_build_bronze_silver_gold`, task `build_bronze_silver_gold` | `src/build_bronze_silver_gold/` | schemas `bronze`, `silver`, `gold` |
 | Integration tables | task `build_business_central_tables` | `src/build_business_central_tables.py` | schema `business_central`, published versions in `ops.publish` |
+| Integration documents | task `build_business_central_documents` | `src/build_business_central_documents.py` | booking versions, posted sales and purchase documents in `business_central` |
 | Checks | task `check_data_quality` | `src/check_data_quality.py` | `ops.dq_results` |
 | Push | systemd timer `vio-push-business-central.timer` on a workstation | `local/push_to_business_central.py` | draft invoices in Business Central, `ops.business_central_sync` |
 | Serving | AI/BI dashboard `Vio Travel overview`, Genie space `Vio Travel Genie` | `dashboards/`, `genie/`, metric views in `src/apply_governance.py` | |
@@ -49,7 +50,7 @@ bug is fixed by replaying the landed files instead of calling the API again.
 | `dashboards/build_dashboard.py`, `genie/build_genie_space.py` | generators of the dashboard and Genie JSON; edit the script, never the JSON |
 | `local/` | the Business Central push, its config, systemd units, `extend_number_series.py` |
 | `sql/` | one-time setup: `setup-catalog.sql` (catalog, grants, `ref` tables), `ref-maps-lab-seed.sql` (lab mappings, never used in production) |
-| `tests/` | unit tests of the API client, the backfill planner, the push logic and SQL shared by the pipeline and the push |
+| `tests/` | unit tests of the API client, the backfill planner, the push logic, SQL shared by the pipeline and the push, and every statement of `build_business_central_documents` parsed as Databricks SQL |
 | `docs/` | `data-flow.drawio`, `star-schema.drawio` and their PNG exports, screenshots of the workspace and Business Central |
 | `.github/workflows/ci.yml`, `.githooks/pre-push` | the same checks in GitHub Actions and before every local push |
 
@@ -64,8 +65,8 @@ the medallion layers, plus one schema each for the integration output, reference
 | `bronze` | `tc_<entity>`: one VARIANT row per landed record with file and run metadata, append-only | pipeline (Auto Loader) | pipeline for bookings and accommodations; the permanent archive for snapshot entities |
 | `silver` | current state per entity and `<entity>_history` (SCD (slowly changing dimension) type 2, with validity dates); typed columns | pipeline, plain views from `vio_travel_apply_governance` | `build_business_central_tables`, engineers |
 | `gold` | star schema `dim_*`, `fact_*`, one big table `obt_booking_service`, metric views `*_metrics` | pipeline, `vio_travel_apply_governance` | every workspace user, personal columns masked |
-| `business_central` | `customers`, `vendors`, `sales_invoices`, `sales_lines`, `purchase_invoices`, `purchase_lines`, shaped like Business Central API v2.0 | `build_business_central_tables` | `local/push_to_business_central.py` |
-| `ref` | `umbrella_agency`, `customer_map`, `vendor_map`: mappings owned by Finance | Finance, through SQL | `build_business_central_tables`, pipeline |
+| `business_central` | `customers`, `vendors`, `sales_invoices`, `sales_lines`, `purchase_invoices`, `purchase_lines`, shaped like Business Central API v2.0; `booking_versions`, `sales_documents`, `purchase_documents`, shaped like the implementation partner specification | `build_business_central_tables`, `build_business_central_documents` | `local/push_to_business_central.py` reads the first six |
+| `ref` | `umbrella_agency`, `customer_map`, `vendor_map`, `business_central_code_map`: mappings owned by Finance | Finance, through SQL | `build_business_central_tables`, `build_business_central_documents`, pipeline |
 | `governance` | function `mask_pii` | `vio_travel_apply_governance` | column masks |
 | `ops` | `api_calls`, `ingest_runs`, `watermark`, `accommodation_fetch`, `pipeline_event_log`, `build_state`, `dq_results`, `publish`, `business_central_sync` | every task and the push | dashboard page Pipeline operations, SQL alert |
 
@@ -207,6 +208,39 @@ a debit to the receivables account and a credit to the revenue account per line.
 
 ![Preview Posting of the same invoice](docs/business-central-preview-posting.png)
 
+### Posted documents per booking version
+
+The implementation partner specifies posted documents instead of drafts (file `VIO_Data warhouse_Integration mapping
+fields-V1.2.xlsx`, sheets `API_Sales_T01` and `API_Purchases_T01`; file `VIO_SO PO integration scenarios-V1.2.xlsx`,
+sheet `Scenarios`). Task `build_business_central_documents` builds them in three tables; the push does not read them yet.
+
+| Table | Grain | Built |
+|---|---|---|
+| `booking_versions` | one DWH version of a booking: a landing in `bronze.tc_bookings` whose fields sent to Business Central differ from the version before | incrementally, MERGE of the bronze rows landed since the last build |
+| `sales_documents` | one Invoice or Credit Memo of a version, lines in column `sales_lines` | rebuilt from `booking_versions` and the current mappings |
+| `purchase_documents` | one Invoice or Credit Memo of a service in a version, line in column `purchase_lines` | rebuilt the same way |
+
+| Change of a booking or service | Sales documents | Purchase documents |
+|---|---|---|
+| first version with a positive total (BOOKED or RQ; a service: BOOKED) | Invoice with a Deposit line, a Balance line due on `payment.deferredLimitDate` and a comment line listing the services | Invoice |
+| total or cost up or down | Invoice or Credit Memo for the difference | Invoice or Credit Memo for the difference |
+| booking or service cancelled (a service also when it leaves the booking) | Credit Memo for the amount invoiced, Invoice for the fee kept | Credit Memo for the difference |
+| customer, vendor or currency changes | Credit Memo for the amount invoiced, new Invoice | Credit Memo, new Invoice |
+
+The IntegrationKey is the booking reference (a service reference for purchases) and the DWH version, column
+`integration_key`. A version starts when the hash of the fields sent to Business Central changes; a landing older than
+one already read is ignored, so a rebuild (job parameter `rebuild=true`) gives the same versions as the incremental
+builds. Invoice numbers follow the AR Masterfile format YYDDDNNN: year, day of the posting date, sequence of the day.
+The signed documents of a booking always add up to its total in the last version sent, and those of a service to its
+cost; blocking checks test that. The booking total of Travel Compositor is the sale of every service, cancelled ones
+with a kept fee included, plus the price changes of their amendments and the agency management fee when the booking
+keeps it at booking level, so the documents use that total and the purchase documents add the amendment costs.
+
+Codes Travel Compositor does not hold come from table `ref.business_central_code_map`: the item per service type
+(`ITEM`), the salesperson or purchaser code and the business unit per booking creator (`SALESPERSON`,
+`BUSINESS_UNIT`). The task creates it empty; `sql/ref-maps-lab-seed.sql` adds the item TOUR and the proposed service
+items as lab seed rows.
+
 ### Fields for the implementation partner
 
 The partner that implements Business Central asks for more than the standard API v2.0 fields: a main booking dimension,
@@ -229,15 +263,29 @@ custom API pages and dimensions.
 | currency factor | `purchase_invoices.currency_factor` | service `pricebreakdown.exchangeRateMicrosite` |
 | amendments | `purchase_invoices.amendment_count`, view `silver.booking_service_amendments` | service `amendments` |
 
-Travel Compositor does not hold the agency currency, the business unit of a user, supplier payment terms, vendor
-invoice numbers, the item per service type, credit reasons, invoice number series or approved customer and vendor
-mappings. Those come from Finance or the partner.
+Fields of the partner specification in `sales_documents` and `purchase_documents`:
+
+| Partner field | Column | Source |
+|---|---|---|
+| IntegrationKey, document type | `integration_key`, `dwh_version`, `document_type` | booking reference or service reference and DWH version |
+| No. (invoice), posting date | `invoice_no`, `posting_date` | YYDDDNNN; creation date, change date or cancellation date |
+| Deposit and Balance lines, line due date, RecID | `sales_lines` | `payment.amount`, the rest of the total, `payment.deferredLimitDate`, booking `id` |
+| Destinations, comment line | `destinations`, `sales_lines` | active hotel stays in check-in order (`1: Tokyo, 2: Kyoto`); services and start dates |
+| Booking Total Amount, cancellation date, main booking | `booking_total_amount`, `cancellation_date`, `main_booking` | booking total, service `cancelationDate`, `bookingAssociatedTo` |
+| Salesperson Code, E-Mail | `salesperson_code`, `sell_to_email` | `ref.business_central_code_map`, `user.email` |
+| Paid Amount, payment method | `paid_amount`, `payment_method` | payments with payment system `TRUST_MY_TRAVEL` |
+| Service Reference, Vendor Order No., Service Total Cost, Currency Factor | `your_reference`, `vendor_order_no`, `service_total_cost`, `currency_factor` | service id and type code, supplier confirmation, cost plus amendments, `exchangeRateMicrosite` |
+
+Travel Compositor does not hold the agency currency and rate, the business unit of a user, supplier payment terms,
+vendor invoice and credit note numbers, the TCODE (credit or refund), the number format of credit memos and purchase
+invoices, or approved customer, vendor and code mappings. The columns for them stay NULL, and each column comment
+says why; the values come from Finance or the partner.
 
 ## Orchestration
 
 | Job or unit | Schedule (Asia/Ho_Chi_Minh) | Tasks | Runs as |
 |---|---|---|---|
-| `vio_travel_ingest_transform_publish` | every 30 minutes, at minute 05 and 35 | `extract_travel_compositor` → `build_bronze_silver_gold` → `build_business_central_tables` → `check_data_quality` (`run_if: ALL_DONE`) | service principal `vio-travel-pipeline` |
+| `vio_travel_ingest_transform_publish` | every hour, at minute 05 | `extract_travel_compositor` → `build_bronze_silver_gold` → `build_business_central_tables` → `build_business_central_documents` → `check_data_quality` (the last two `run_if: ALL_DONE`) | service principal `vio-travel-pipeline` |
 | `vio_travel_ingest_accommodation_catalog` | Sunday 03:15 | `extract_accommodation_catalog` | service principal |
 | `vio_travel_apply_governance` | Sunday 03:45; run by hand after each deploy | masking function, tags, masks, grants, comments, plain views, metric views, anomaly detection | deploying user, who owns the catalog |
 | `vio_travel_backfill_bookings` | manual | `plan_backfill_windows` → for-each `extract_booking_windows` (one month per iteration, 3 in parallel) | service principal |
@@ -260,6 +308,8 @@ run.
 |---|---|---|
 | pipeline expectations (`bronze_`, `silver_`) | keys present, dates ordered, amounts present, payload parsed | rows without a key are dropped, other rules warn; counts copied into `ops.dq_results` |
 | `build_business_central_tables`, severity `block` | unique document keys, a customer or vendor and a currency on every document, one currency per invoice, Business Central field lengths | nothing is published, and the push keeps the previous build |
+| `build_business_central_documents`, severity `block` | versions numbered 1 to n, unique document keys, invoice numbers of 8 digits and unique, documents adding up to the booking total and the service cost, deposit and balance adding up to the invoice | the task fails after writing its results; the next run rebuilds the documents |
+| `build_business_central_documents`, severity `warn` | documents held or with an unmapped item, invoices without destinations, payment split that differs from the total, amendment costs in another currency | recorded and shown on the dashboard |
 | `build_business_central_tables` and `check_data_quality`, severity `warn` | held documents, totals that differ from lines, unknown service arrays, unknown suppliers, overdue payments, sales waiting for the push | recorded and shown on the dashboard |
 | `check_data_quality`, severity `alert` (`gold_`, `e2e_`) | gold key uniqueness, fact grain, orphan facts, totals against silver; extract failing or stale per entity, no booking updated in Travel Compositor for 48 hours, pipeline failed or stale, `business_central` behind silver, push stalled | the task fails and the failure e-mail goes out |
 | anomaly detection on `silver`, `gold`, `business_central` | freshness and completeness of every table, learned from its history | Unity Catalog health indicator and the system table `system.data_quality_monitoring.table_results` |
@@ -325,7 +375,7 @@ are on.
 | Task keys | `<verb>_<object>`, with the source file or folder named like the task | task `build_bronze_silver_gold`, folder `src/build_bronze_silver_gold/` |
 | Check names | `<layer>_<what is wrong>`; a bronze expectation adds the table | `gold_fact_orphans`, `bronze_record_parsed.tc_bookings` |
 | Tags | jobs and the pipeline: `project: vio_travel`, `data_classification` (`personal_data`, `internal`, `public`); Unity Catalog: `contains_pii`, `pii` | |
-| Python | ruff lint and format, line length 120, standard library plus `requests` and `databricks-sdk` | |
+| Python | ruff lint and format, line length 120, standard library plus `requests` and `databricks-sdk`; tests also use `sqlglot` | |
 | Commits | imperative English subject, one concern per commit | `Retry the rate source on timeouts and 5xx` |
 | Branches | `main` is deployed; work happens on `<user>-dev/<topic>` and is merged | `<user>-dev/push-scope` |
 
@@ -336,7 +386,7 @@ logged in to the workspace, and the Azure CLI for the push.
 
 ```bash
 uvx ruff check . && uvx ruff format --check .
-uv run --no-project --with pytest --with requests --with databricks-sdk pytest -q tests
+uv run --no-project --with pytest --with requests --with databricks-sdk --with sqlglot pytest -q tests
 git config core.hooksPath .githooks        # run the same checks before every git push
 databricks bundle validate -t prod
 ```
@@ -395,5 +445,13 @@ IDs only, no credential.
 - The accommodation catalog is tracked by its field `lastUpdate`, so a hotel removed from the catalog stays current.
 - Snapshot history is applied from landing files, not from bronze, so a lost history table could be rebuilt only for
   the 90 days landing keeps; older snapshots stay in bronze.
-- Posting, credit memos, deposits and the business unit dimension are not implemented.
+- The push creates drafts from the six Business Central API v2.0 tables; posting and the posted documents of
+  `sales_documents` and `purchase_documents` wait for the custom API pages of the implementation partner.
+- Booking versions start with the first landing in `bronze.tc_bookings`: a change made before the lab loaded a booking,
+  or between two reads of it, is not a version of its own.
+- Invoice numbers are recomputed by every build. They stay the same while versions are only added, but a change of a
+  mapping that changes a customer or vendor, or a rebuild, can renumber them; they become final only when a push
+  records them.
+- `payment.amount` plus `payment.deferredAmount` differs from the booking total on some bookings, so the deposit line
+  takes `payment.amount` and the balance line the rest. Paid Amount uses payments through Trust My Travel only.
 - The push depends on a workstation and a delegated login; production needs an app registration and a job.

@@ -58,6 +58,9 @@ PII_TABLES = [
     *PII_COLUMNS,
     "business_central.customers",
     "business_central.vendors",
+    "business_central.booking_versions",
+    "business_central.sales_documents",
+    "ref.business_central_code_map",
 ]
 HISTORY = tuple(t for t in PII_COLUMNS if t.endswith("_history"))
 STREAMING = ("bronze.", "silver.bookings", "silver.accommodation_details", "silver.accommodations_history") + HISTORY
@@ -71,7 +74,7 @@ TABLE_COMMENTS = {
     "ops.watermark": "Last booking update date read completely by extract_travel_compositor; the next run starts there minus the "
     "overlap.",
     "ops.accommodation_fetch": "One row per accommodation datasheet fetch of extract_travel_compositor: time, status, run.",
-    "ops.build_state": "Content token of silver and ref per task build; build_business_central_tables skips the rebuild when it is unchanged.",
+    "ops.build_state": "Content token of the inputs per task build; build_business_central_tables and build_business_central_documents skip the rebuild when it is unchanged.",
     "ops.dq_results": "Data-quality results per job run: check name, severity, failed rows, sample keys.",
     "ops.publish": "Write-audit-publish log: business_central table versions published after the blocking checks "
     "passed; local/push_to_business_central.py reads the tables AS OF the latest row.",
@@ -83,6 +86,8 @@ TABLE_COMMENTS = {
     "agency. Maintained by Vio Finance.",
     "ref.vendor_map": "Business Central vendor number per provider code (PROVIDER) or manual supplier name in lower "
     "case (MANUAL_NAME). Maintained by Vio Finance.",
+    "ref.business_central_code_map": "Business Central item per service type (ITEM), salesperson and business unit per "
+    "booking creator (SALESPERSON, BUSINESS_UNIT), codes Travel Compositor does not hold. Maintained by Vio Finance.",
 }
 
 SILVER_VIEWS = {

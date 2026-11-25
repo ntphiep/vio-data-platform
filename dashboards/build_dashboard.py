@@ -158,7 +158,8 @@ DATASETS = {
                (SELECT max_by(failed_rows, checked_at) FROM ops.dq_results
                 WHERE check_name = 'e2e_sales_waiting_for_push') AS sales_waiting_for_push""",
     # latest result of every check that ran in the last day: pipeline expectations (severity expect), gold_ and
-    # e2e_ checks of check_data_quality, business_central_ checks of build_business_central_tables (which skips unchanged runs, so its latest results can
+    # e2e_ checks of check_data_quality, business_central_ checks of build_business_central_tables and
+    # build_business_central_documents (which skip unchanged runs, so their latest results can
     # come from an earlier run)
     "dq_latest": """
         SELECT check_name, severity, failed_rows, sample, checked_at, run_id FROM (

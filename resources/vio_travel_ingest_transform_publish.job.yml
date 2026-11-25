@@ -6,8 +6,10 @@ resources:
         Travel Compositor API -> volume raw.landing (extract_travel_compositor) -> pipeline vio_travel_build_bronze_silver_gold (bronze, silver
         with history, gold star schema read by the dashboard vio_travel_overview and the Genie space) -> Business
         Central integration tables in business_central (build_business_central_tables, published only after its blocking checks pass,
-        then pushed by local/push_to_business_central.py outside Databricks because it uses a delegated Azure CLI login). The last
-        task, check_data_quality, records pipeline expectations, gold checks and end-to-end freshness.
+        then pushed by local/push_to_business_central.py outside Databricks because it uses a delegated Azure CLI login) ->
+        posted sales and purchase documents per booking version in the shape of the implementation partner specification
+        (build_business_central_documents, not pushed yet). The last task, check_data_quality, records pipeline
+        expectations, gold checks and end-to-end freshness.
       max_concurrent_runs: 1
       run_as:
         service_principal_name: ${var.pipeline_sp}
@@ -67,9 +69,22 @@ resources:
             python_file: ../src/build_business_central_tables.py
             parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}",
                          "--rebuild", "{{job.parameters.rebuild}}"]
-        - task_key: check_data_quality
+        # Not part of the write-audit-publish of build_business_central_tables: local/push_to_business_central.py does
+        # not read these tables, so its blocking checks fail this task only. ALL_DONE: the documents are built from
+        # bronze, which a failed draft-invoice build leaves as it is.
+        - task_key: build_business_central_documents
           depends_on:
             - task_key: build_business_central_tables
+          run_if: ALL_DONE
+          environment_key: default
+          max_retries: 1
+          spark_python_task:
+            python_file: ../src/build_business_central_documents.py
+            parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}",
+                         "--rebuild", "{{job.parameters.rebuild}}"]
+        - task_key: check_data_quality
+          depends_on:
+            - task_key: build_business_central_documents
           run_if: ALL_DONE          # also after a failed task, so the end-to-end state is always recorded
           environment_key: default
           spark_python_task:

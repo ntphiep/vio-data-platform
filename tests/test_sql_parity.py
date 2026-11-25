@@ -29,3 +29,25 @@ def test_service_arrays_match_business_central_tables():
     silver = constant(SRC / "build_bronze_silver_gold" / "silver.py", "SERVICE_ARRAYS")
     bc = constant(SRC / "build_business_central_tables.py", "SERVICE_ARRAYS")
     assert silver == bc
+
+
+def test_build_business_central_documents_shares_service_constants():
+    """Service arrays, manual keys and country rule of silver.booking_services; type codes and provider vendor number
+    of build_business_central_tables (the purchase_key and vendor number of the purchase documents)."""
+    docs = SRC / "build_business_central_documents.py"
+    silver = SRC / "build_bronze_silver_gold" / "silver.py"
+    bc = SRC / "build_business_central_tables.py"
+    for name in ("SERVICE_ARRAYS", "MANUAL_KEYS", "COUNTRY_SUFFIX"):
+        assert constant(docs, name) == constant(silver, name), name
+    for name in ("TYPE_CODES", "PROVIDER_VENDOR_NUMBER"):
+        assert constant(docs, name) == constant(bc, name), name
+
+
+def test_setup_catalog_creates_the_code_map_like_the_task():
+    """sql/setup-catalog.sql and build_business_central_documents create ref.business_central_code_map alike."""
+    setup = (SRC.parent / "sql" / "setup-catalog.sql").read_text()
+    ddl = setup.split("ref.business_central_code_map (", 1)[1].split(")\nCOMMENT", 1)[0]
+    columns = constant(SRC / "build_business_central_documents.py", "CODE_MAP_COLUMNS")
+    assert [line.strip().rstrip(",") for line in ddl.strip().splitlines()] == [
+        f"{n} {t} COMMENT '{c}'" for n, t, c in columns
+    ]

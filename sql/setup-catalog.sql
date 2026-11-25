@@ -36,3 +36,13 @@ CREATE TABLE IF NOT EXISTS vio_travel.ref.customer_map (
   agency_reference_key STRING, bc_customer_no STRING, display_name STRING, approved_by STRING, note STRING);
 CREATE TABLE IF NOT EXISTS vio_travel.ref.vendor_map (
   source_kind STRING, source_key STRING, bc_vendor_no STRING, display_name STRING, approved_by STRING, note STRING);
+-- Business Central codes that Travel Compositor does not hold (item, salesperson, business unit); read by
+-- build_business_central_documents, which creates the table with the same columns when it is missing.
+CREATE TABLE IF NOT EXISTS vio_travel.ref.business_central_code_map (
+  map_kind STRING COMMENT 'ITEM, SALESPERSON or BUSINESS_UNIT.',
+  source_key STRING COMMENT 'ITEM: SALES (tour item), CANCELLATION (cancellation item) or a service type such as hotelservice. SALESPERSON and BUSINESS_UNIT: lower-case username of the booking creator (personal data).',
+  bc_code STRING COMMENT 'Business Central code: item no., salesperson/purchaser code or BUSINESS UNIT dimension value.',
+  display_name STRING COMMENT 'Name of the code.',
+  approved_by STRING COMMENT 'Who in Vio Finance approved the row, or LAB SEED for rows that only serve the lab.',
+  note STRING COMMENT 'Free text.')
+COMMENT 'Business Central codes owned by Vio Finance that Travel Compositor does not hold: item per service type, salesperson/purchaser and business unit per booking creator. Read by build_business_central_documents.';

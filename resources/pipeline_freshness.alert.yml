@@ -1,6 +1,6 @@
 resources:
   alerts:
-    # Dead-man switch: the job writes end-to-end checks every 30 minutes. If none arrived for 75 minutes, the job
+    # Dead-man switch: the job writes end-to-end checks every hour. If none arrived for 150 minutes, the job
     # is not running at all (paused, quota shut down, deploy broken), which no task inside the job can report.
     pipeline_freshness:
       display_name: Vio Travel pipeline freshness
@@ -14,12 +14,14 @@ resources:
         comparison_operator: GREATER_THAN
         threshold:
           value:
-            double_value: 75
+            double_value: 150
         empty_result_state: TRIGGERED
         notification:
           notify_on_ok: true
           subscriptions:
             - user_email: ${workspace.current_user.userName}
       schedule:
-        quartz_cron_schedule: "0 50 * * * ?"
+        # minute 25: inside the 10 minutes the warehouse stays up after the push that follows the run at minute 05,
+        # so the alert does not start the warehouse on its own (Free Edition cannot change auto stop)
+        quartz_cron_schedule: "0 25 * * * ?"
         timezone_id: Asia/Ho_Chi_Minh

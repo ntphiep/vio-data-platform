@@ -14,9 +14,10 @@ resources:
       timeout_seconds: 7200
       queue: {enabled: true}
       schedule:
-        # every 30 minutes, at minute 05 and 35; the pipeline refreshes only what changed and build_business_central_tables skips the
-        # rebuild when silver did not change, so night runs stay short (Free Edition has a daily compute quota)
-        quartz_cron_expression: "0 5/30 * * * ?"
+        # every hour at minute 05. Every 30 minutes used up the Free Edition daily compute quota by about 14:00, after
+        # which no job, pipeline or warehouse could start until the quota reset. The pipeline refreshes only what
+        # changed and build_business_central_tables skips the rebuild when silver did not change.
+        quartz_cron_expression: "0 5 * * * ?"
         timezone_id: Asia/Ho_Chi_Minh
         pause_status: UNPAUSED
       health:

@@ -25,9 +25,9 @@ ATTEMPT = TERMINAL[:-1] + ", 'FAILED')"
 MAX_FAILURES = 3
 # Minutes after which the last successful extract of an entity is stale: twice its cadence plus margin.
 STALE_MINUTES = {
-    "bookings": 75,
-    "pending_payments": 75,
-    "purchase_attempts": 75,
+    "bookings": 150,
+    "pending_payments": 150,
+    "purchase_attempts": 150,
     "agencies": 13 * 60,
     "suppliers": 13 * 60,
     "users": 13 * 60,
@@ -45,8 +45,8 @@ def main():
     ap.add_argument("--catalog", default="vio_travel")
     ap.add_argument("--run_id", default="")
     ap.add_argument("--bc_company", default="My Company")
-    ap.add_argument("--pipeline_stale_minutes", type=int, default=75, help="the job runs every 30 min")
-    ap.add_argument("--push_stale_minutes", type=int, default=120)
+    ap.add_argument("--pipeline_stale_minutes", type=int, default=150, help="the job runs every hour")
+    ap.add_argument("--push_stale_minutes", type=int, default=180, help="the push follows each hourly run")
     ap.add_argument("--push_scope_days", type=int, default=30, help="same as scope_sql in local/config.json")
     ap.add_argument("--ops_retention_days", type=int, default=180, help="ops.api_calls and ops.dq_results")
     a = ap.parse_args()

@@ -22,8 +22,8 @@ Flow per run
    (purchase). A draft is never deleted (deleting a numbered draft creates an empty posted invoice). A posted
    document is never touched and is reported as NEEDS_CREDIT_MEMO. A cancelled booking or service empties the
    lines of its draft so it cannot be posted (CANCELLED_DRAFT_EMPTIED).
-7. A document synced before that is no longer in the published tables (booking left BOOKED/RQ/CANCELED, service
-   cost dropped to 0, key changed) has its draft emptied (REMOVED_DRAFT_EMPTIED); a posted one is only recorded
+7. A document synced before that is no longer in the published tables (booking left BOOKED/RQ/CANCELED, active
+   service cost dropped to 0, key changed) has its draft emptied (REMOVED_DRAFT_EMPTIED); a posted one is only recorded
    (REMOVED_POSTED). More than max_removals_per_run such documents stop the removal step for a human check.
 8. Write the result rows into ops.business_central_sync after every booking, so a crash loses at most one booking's rows; a
    document created but not recorded is found again by its key on the next run and updated, not duplicated.
@@ -667,7 +667,9 @@ STATE_COLS = "st.attempt_hash, st.attempt_result, st.log_hash, st.log_result, st
 
 def doc_queries(c, company, g, scope):
     """SQL for the sales and purchase documents in scope with their sync state, and for the documents synced
-    before that are no longer in the published tables. scope filters sales_invoices, alias i."""
+    before that are no longer in the published tables. scope filters sales_invoices, alias i, and bounds new
+    documents only: a document sent before whose payload changed is always selected, so a late cancellation of an
+    old booking still empties its draft."""
     with_state = state_sql(c, company)
     # a purchase whose booking has no sales invoice (every service sold at 0) falls back to its own invoice date
     purchase_scope = scope.replace("i.invoice_date", "coalesce(i.invoice_date, p.invoice_date)")
@@ -677,14 +679,14 @@ def doc_queries(c, company, g, scope):
         LEFT JOIN st ON st.doc_type = 'sales' AND st.doc_key = i.external_document_number
         LEFT JOIN fl ON fl.doc_type = 'sales' AND fl.doc_key = i.external_document_number
                     AND fl.payload_hash = i.payload_hash
-        WHERE {scope}"""
+        WHERE ({scope}) OR (st.ever_sent AND st.attempt_hash IS DISTINCT FROM i.payload_hash)"""
     purchases = f"""{with_state}
         SELECT p.*, i.hold_reason AS sales_hold_reason, {STATE_COLS}, coalesce(fl.failures, 0) AS failures
         FROM {g["purchase_invoices"]} p
         LEFT JOIN {g["sales_invoices"]} i ON i.external_document_number = p.booking_ref
         LEFT JOIN st ON st.doc_type = 'purchase' AND st.doc_key = p.purchase_key
         LEFT JOIN fl ON fl.doc_type = 'purchase' AND fl.doc_key = p.purchase_key AND fl.payload_hash = p.payload_hash
-        WHERE {purchase_scope}"""
+        WHERE ({purchase_scope}) OR (st.ever_sent AND st.attempt_hash IS DISTINCT FROM p.payload_hash)"""
     removed = f"""{with_state}
         SELECT st.doc_type, st.doc_key, st.attempt_result FROM st
         LEFT ANTI JOIN (SELECT 'sales' AS doc_type, external_document_number AS doc_key FROM {g["sales_invoices"]}

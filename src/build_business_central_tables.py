@@ -33,9 +33,9 @@ TABLES = ["customers", "vendors", "sales_invoices", "sales_lines", "purchase_inv
 TABLE_COMMENTS = {
     "customers": "Business Central customers: one per Travel Compositor agency (AG<id>), plus customers of ref.customer_map.",
     "vendors": "Business Central vendors: Travel Compositor suppliers (SP<id>), providers (PV<code>), ref.vendor_map.",
-    "sales_invoices": "One sales invoice per BOOKED, RQ or CANCELED booking (externalDocumentNumber); held when hold_reason is set.",
+    "sales_invoices": "One sales invoice per BOOKED, RQ or CANCELED booking (externalDocumentNumber); CANCEL when the booking is cancelled or has no line left; held when hold_reason is set.",
     "sales_lines": "Lines of sales_invoices: one per BOOKED or RQ service with a non-zero sale amount, in the sale currency.",
-    "purchase_invoices": "One purchase invoice per service with a non-zero cost (vendorInvoiceNumber = purchase_key); held when hold_reason is set.",
+    "purchase_invoices": "One purchase invoice per service with a non-zero cost (vendorInvoiceNumber = purchase_key), plus CANCEL rows for cancelled services; held when hold_reason is set.",
     "purchase_lines": "One line per UPSERT purchase invoice: the service cost in the cost currency.",
 }
 PII_TABLES = ["customers", "vendors"]
@@ -187,8 +187,13 @@ def main():
         FROM {c}.silver.booking_services s
         JOIN booking_customer b ON b.booking_ref = s.booking_ref AND b.doc_action = 'UPSERT'
         WHERE s.status IN ('BOOKED', 'RQ') AND s.sale_amount <> 0""")
+    # A booking keeps its sales invoice row while it is BOOKED, RQ or CANCELED. When it has no line left (every
+    # service cancelled or sold at 0) the row stays with doc_action CANCEL, so the push empties a draft it sent
+    # before through the normal path; a document that vanished from the table would count as an unexplained removal.
+    # A CANCEL row is never held.
     sql(f"""CREATE OR REPLACE TABLE {b}.sales_invoices AS
-        SELECT b.booking_ref AS external_document_number, b.doc_action, b.customer_number, b.hold_reason, b.status,
+        SELECT b.booking_ref AS external_document_number, b.doc_action, b.customer_number,
+               CASE WHEN b.doc_action = 'UPSERT' THEN b.hold_reason END AS hold_reason, b.status,
                b.agency_id, b.payload:agencyBookingReference::string AS agency_reference,
                to_date(b.created_at) AS invoice_date, b.start_date AS service_start_date, b.currency AS currency_code,
                b.total_price, coalesce(l.lines_total, 0) AS lines_total, l.line_currencies, b.last_update_at,
@@ -203,15 +208,18 @@ def main():
                sha2(CASE WHEN b.doc_action = 'CANCEL' THEN 'CANCEL ' ELSE '' END ||
                     to_json(named_struct('c', b.customer_number, 'cur', b.currency, 'd', to_date(b.created_at),
                                          'l', l.lines)), 256) AS payload_hash
-        FROM booking_customer b
+        FROM (SELECT bc.* EXCEPT (doc_action),
+                     CASE WHEN bc.doc_action = 'UPSERT' AND bl.booking_ref IS NULL THEN 'CANCEL' ELSE bc.doc_action END
+                       AS doc_action
+              FROM booking_customer bc
+              LEFT JOIN (SELECT DISTINCT booking_ref FROM {b}.sales_lines) bl ON bl.booking_ref = bc.booking_ref) b
         LEFT JOIN (SELECT booking_ref, sum(amount) AS lines_total,
                           array_join(array_sort(collect_set(currency)), ',') AS line_currencies,
                           sort_array(collect_list(named_struct('n', line_no, 'd', description, 'a', amount))) AS lines
                    FROM {b}.sales_lines GROUP BY booking_ref) l ON l.booking_ref = b.booking_ref
         LEFT JOIN (SELECT booking_ref, max(cancellation_date) AS cancellation_date,
                           min_by(destination_country, start_date) AS destination_country
-                   FROM {c}.silver.booking_services GROUP BY booking_ref) sv ON sv.booking_ref = b.booking_ref
-        WHERE b.doc_action = 'CANCEL' OR l.booking_ref IS NOT NULL""")
+                   FROM {c}.silver.booking_services GROUP BY booking_ref) sv ON sv.booking_ref = b.booking_ref""")
     # Purchases: one invoice per service (implementation partner spec API_Purchases_T01 row 5). Vendor: Travel Compositor
     # supplier ID; for API services without one, the provider code; for manual services, ref.vendor_map.
     sql(f"""CREATE OR REPLACE TEMP VIEW service_vendor AS
@@ -232,11 +240,12 @@ def main():
         LEFT JOIN {c}.ref.vendor_map mm ON mm.source_kind = 'MANUAL_NAME'
                                         AND mm.source_key = lower(trim(s.supplier_name))
         LEFT JOIN {c}.silver.suppliers sp ON sp.supplier_id = s.supplier_id
-        WHERE s.cost_amount IS NOT NULL AND s.cost_amount <> 0""")
+        WHERE (s.cost_amount IS NOT NULL AND s.cost_amount <> 0)
+           OR NOT (b.doc_action = 'UPSERT' AND s.status IN ('BOOKED', 'RQ'))""")
     sql(f"""CREATE OR REPLACE TABLE {b}.purchase_invoices AS
         -- Travel Compositor service IDs are unique only inside one service type, so the key adds a type code.
         SELECT service_id || '-' || type_code AS purchase_key, doc_action, booking_ref, service_id, service_type,
-               is_manual, vendor_number, hold_reason, status, supplier_id, provider, supplier_name,
+               is_manual, vendor_number, CASE WHEN doc_action = 'UPSERT' THEN hold_reason END AS hold_reason, status, supplier_id, provider, supplier_name,
                cost_currency AS currency_code, service_id || '-' || type_code AS vendor_invoice_number,
                provider_reference AS vendor_order_number, to_date(booking_created_at) AS invoice_date,
                -- fields of the partner purchase specification (API_Purchases_T01), not sent by the push yet
@@ -246,7 +255,15 @@ def main():
                sha2(CASE WHEN doc_action = 'CANCEL' THEN 'CANCEL ' ELSE '' END ||
                     to_json(named_struct('v', vendor_number, 'c', cost_currency, 'a', cost_amount,
                                          'd', to_date(booking_created_at))), 256) AS payload_hash
-        FROM (SELECT *, {type_code_sql()} AS type_code FROM service_vendor)""")
+        FROM (SELECT *, {type_code_sql()} AS type_code,
+                     coalesce(cost_amount, 0) <> 0 AS has_cost FROM service_vendor)
+        -- Travel Compositor sets the net cost of a cancelled service to 0. Such a service stays as a CANCEL row,
+        -- so the push empties the draft it sent before; one without a cost is kept only when its key is not taken
+        -- by a service with a cost and once per key, so blocking check business_central_purchase_key_unique
+        -- still tests the services with a cost only.
+        QUALIFY has_cost OR (NOT max(has_cost) OVER (PARTITION BY service_id || '-' || type_code)
+                             AND row_number() OVER (PARTITION BY service_id || '-' || type_code
+                                                    ORDER BY booking_created_at DESC) = 1)""")
     sql(f"""CREATE OR REPLACE TABLE {b}.purchase_lines AS
         SELECT purchase_key, booking_ref, 1 AS line_no,
                left(service_type || ' - ' || coalesce(supplier_name, provider, ''), 100) AS description,
@@ -264,7 +281,7 @@ def main():
         UNION ALL
         SELECT bc_number, NULL, display_name, NULL, NULL, NULL, NULL, NULL, sha2(display_name, 256) FROM (
           SELECT DISTINCT vendor_number AS bc_number, provider AS display_name FROM {b}.purchase_invoices
-          WHERE supplier_id IS NULL AND NOT is_manual AND vendor_number LIKE 'PV%'
+          WHERE supplier_id IS NULL AND NOT is_manual AND vendor_number LIKE 'PV%' AND lines_total <> 0
           UNION SELECT DISTINCT bc_vendor_no, display_name FROM {c}.ref.vendor_map) v
         WHERE bc_number NOT IN (SELECT 'SP' || supplier_id FROM {c}.silver.suppliers)""")
     for t, text in TABLE_COMMENTS.items():
@@ -339,9 +356,8 @@ def main():
         ),
         "business_central_active_booking_without_lines": (
             "warn",
-            f"""SELECT b.booking_ref AS k FROM {c}.silver.bookings b
-            LEFT ANTI JOIN {b}.sales_invoices i ON i.external_document_number = b.booking_ref
-            WHERE b.status IN ('BOOKED','RQ')""",
+            f"""SELECT external_document_number AS k FROM {b}.sales_invoices
+            WHERE status IN ('BOOKED','RQ') AND doc_action = 'CANCEL'""",
         ),
         "business_central_sales_held_customer_unmapped": (
             "warn",

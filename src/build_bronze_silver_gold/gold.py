@@ -744,15 +744,20 @@ def fact_pending_payment():
     ),
 )
 def fact_booking_status_change():
+    # Travel Compositor sometimes changes a tracked field (paid amount, pax) without moving lastUpdateDate; the
+    # history then holds two versions with the same last_update_at that differ by landing time. The fact keeps the
+    # later landing per (booking_ref, valid_from), which is the state Travel Compositor reported for that time.
     return spark.sql(f"""
-        SELECT booking_ref, __START_AT.last_update_at AS valid_from, __END_AT.last_update_at AS valid_to,
-               {date_key("__START_AT.last_update_at")} AS change_date_key,
+        SELECT booking_ref, valid_from, valid_to, {date_key("valid_from")} AS change_date_key,
                lag(status) OVER w AS previous_status, status,
                coalesce(agency_id, '{UNKNOWN}') AS agency_key, currency, total_price,
                CAST(total_price - lag(total_price) OVER w AS DECIMAL(18,2)) AS total_price_change,
                paid_amount, pax, start_date, end_date
-        FROM {S}.bookings_history
-        WINDOW w AS (PARTITION BY booking_ref ORDER BY __START_AT)""")
+        FROM (SELECT *, __START_AT.last_update_at AS valid_from, __END_AT.last_update_at AS valid_to
+              FROM {S}.bookings_history
+              QUALIFY row_number() OVER (PARTITION BY booking_ref, __START_AT.last_update_at
+                                         ORDER BY __START_AT.ingested_at DESC) = 1)
+        WINDOW w AS (PARTITION BY booking_ref ORDER BY valid_from)""")
 
 
 @dp.materialized_view(

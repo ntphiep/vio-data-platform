@@ -302,6 +302,32 @@ dp.create_auto_cdc_flow(
 )
 
 
+# Country code at the end of a free-text place, as manual flights write it: '(KIX) Osaka,  Kansai, JP'.
+COUNTRY_SUFFIX = "', *([A-Z]{2}) *$'"
+
+
+def amendment_sum(service: str, path: str, currency: str = "") -> str:
+    """Sum of one decimal of the amendments of a service VARIANT; with currency, only amendments in that currency.
+
+    Travel Compositor keeps a cost either in providerNetPrice or in netProviderPrice, so a cost path is read from both.
+    """
+    amount = f"variant_get(a, {path}, 'decimal(18,2)')"
+    if "providerNetPrice" in path:
+        alt = path.replace("providerNetPrice", "netProviderPrice")
+        amount = f"coalesce({amount}, variant_get(a, {alt}, 'decimal(18,2)'))"
+    if currency:
+        cur = path.replace(".amount'", ".currency'")
+        amendment_currency = (
+            f"coalesce(variant_get(a, {cur}, 'string'), "
+            f"variant_get(a, {cur.replace('providerNetPrice', 'netProviderPrice')}, 'string'))"
+        )
+        amount = f"CASE WHEN {amendment_currency} = {currency} THEN {amount} END"
+    return (
+        f"coalesce(aggregate(cast({service}:amendments AS ARRAY<VARIANT>), CAST(0 AS DECIMAL(18,2)), "
+        f"(acc, a) -> CAST(acc + coalesce({amount}, 0) AS DECIMAL(18,2))), CAST(0 AS DECIMAL(18,2)))"
+    )
+
+
 def _explode_services(cols: str) -> str:
     """Two scans of silver.bookings (typed arrays, then manualServices) instead of one scan per array.
 
@@ -350,7 +376,10 @@ def _explode_services(cols: str) -> str:
         supplier_confirmation STRING
         cancellation_date DATE
         exchange_rate_microsite DECIMAL(24,12)
-        amendment_count INT""",
+        amendment_count INT
+        amendment_sale_amount DECIMAL(18,2)
+        amendment_cost_amount DECIMAL(18,2)
+        agency_management_fee DECIMAL(18,2)""",
         {
             "service_id": "Travel Compositor service id, unique only inside one service type; booking_ref-type if absent.",
             "service_type": "Service array of the payload (hotelservice ...) or manual_<kind> for manualServices.",
@@ -362,7 +391,9 @@ def _explode_services(cols: str) -> str:
             "provider": "Provider code of an API service.",
             "provider_reference": "Booking reference at the provider.",
             "accommodation_id": "Travel Compositor accommodation id of a hotel service.",
-            "destination_country": "Destination country code (upper case).",
+            "destination_country": "Destination country code (upper case): country of the service, else the code that "
+            "ends its destination or origin text (manual flights), else the country of another service of the booking "
+            "with the same destination name. NULL for items and accounting adjustments, which have no place.",
             "sale_currency": "Currency of sale_amount (microsite price).",
             "sale_amount": "Sale price of the service, in sale_currency.",
             "cost_currency": "Currency the supplier charges.",
@@ -373,6 +404,11 @@ def _explode_services(cols: str) -> str:
             "cancellation_date": "Day the service was cancelled (cancelationDate); NULL when not cancelled.",
             "exchange_rate_microsite": "Travel Compositor exchangeRateMicrosite of the service price; the implementation partner maps it to the Currency Factor.",
             "amendment_count": "Number of amendments of the service; details in silver.booking_service_amendments.",
+            "amendment_sale_amount": "Sum of the sale price changes of the amendments, in sale_currency. Travel "
+            "Compositor adds them to the booking total, not to sale_amount.",
+            "amendment_cost_amount": "Sum of the supplier cost changes of the amendments that are in cost_currency.",
+            "agency_management_fee": "Agency management fee included in sale_amount; 0 when the booking keeps the fee "
+            "only at booking level (silver.bookings.agency_management_fee).",
         },
     ),
 )
@@ -381,30 +417,50 @@ def _explode_services(cols: str) -> str:
     "status NOT IN ('BOOKED','RQ') OR (sale_amount IS NOT NULL AND cost_amount IS NOT NULL)",
 )
 def booking_services():
-    return spark.sql(
-        _explode_services("""booking_ref, coalesce(s:id::string, booking_ref || '-' || service_type) AS service_id,
+    # Amendments are price changes that Travel Compositor adds to the booking total (and to netProvider) next to the
+    # service price, so their sums are kept per service. A manual flight often has no country but ends its
+    # destination text with the country code ('(GMP) Seoul, Gimpo International Airport, KR'); a manual hotel or
+    # ticket with a free-text destination takes the country of another service of the booking with the same name.
+    cost_currency = "coalesce(s:pricebreakdown.providerNetPrice.currency::string, s:pricebreakdown.netProviderPrice.currency::string)"
+    sale_change = amendment_sum("s", "'$.priceBreakDown.totalPrice.microsite.amount'")
+    cost_change = amendment_sum("s", "'$.priceBreakDown.providerNetPrice.amount'", cost_currency)
+    inner = _explode_services(f"""booking_ref, coalesce(s:id::string, booking_ref || '-' || service_type) AS service_id,
            service_type, is_manual, s:status::string AS status,
            coalesce(s:hotelName::string, s:name::string, s:airlineName::string, s:description::string) AS name,
            s:supplierId::string AS supplier_id,
            coalesce(s:supplierName::string, s:providerName::string) AS supplier_name,
            s:provider::string AS provider,
            coalesce(s:providerBookingReference::string, s:providerTransferCode::string) AS provider_reference,
-           s:hotelId::string AS accommodation_id, upper(s:country::string) AS destination_country,
+           s:hotelId::string AS accommodation_id,
+           coalesce(upper(s:country::string),
+                    nullif(regexp_extract(s:destination::string, {COUNTRY_SUFFIX}, 1), ''),
+                    nullif(regexp_extract(s:origin::string, {COUNTRY_SUFFIX}, 1), '')) AS own_country,
            initcap(coalesce(s:destinationName::string, s:locationName::string, s:destination::string))
              AS destination_name,
            to_date(left(s:startDate::string,10)) AS start_date, to_date(left(s:endDate::string,10)) AS end_date,
            s:pricebreakdown.totalPrice.microsite.currency::string AS sale_currency,
            s:pricebreakdown.totalPrice.microsite.amount::decimal(18,2) AS sale_amount,
-           coalesce(s:pricebreakdown.providerNetPrice.currency::string,
-                    s:pricebreakdown.netProviderPrice.currency::string) AS cost_currency,
+           {cost_currency} AS cost_currency,
            coalesce(s:pricebreakdown.providerNetPrice.amount::decimal(18,2),
                     s:pricebreakdown.netProviderPrice.amount::decimal(18,2)) AS cost_amount,
            s:pricebreakdown.netProvider.microsite.amount::decimal(18,2) AS cost_in_sale_currency,
            last_update_at, nullif(trim(s:bookingReference::string), '') AS supplier_confirmation,
            to_date(left(s:cancelationDate::string, 10)) AS cancellation_date,
            s:pricebreakdown.exchangeRateMicrosite::decimal(24,12) AS exchange_rate_microsite,
-           coalesce(array_size(cast(s:amendments AS ARRAY<VARIANT>)), 0) AS amendment_count""")
-    )
+           coalesce(array_size(cast(s:amendments AS ARRAY<VARIANT>)), 0) AS amendment_count,
+           {sale_change} AS amendment_sale_amount, {cost_change} AS amendment_cost_amount,
+           coalesce(s:pricebreakdown.agencyManagementFee.microsite.amount::decimal(18,2), 0) AS agency_management_fee""")
+    return spark.sql(f"""
+        SELECT booking_ref, service_id, service_type, is_manual, status, name, supplier_id, supplier_name, provider,
+               provider_reference, accommodation_id,
+               coalesce(own_country, CASE WHEN destination_name IS NOT NULL THEN first_value(own_country, true) OVER (
+                 PARTITION BY booking_ref, lower(destination_name) ORDER BY start_date, service_id
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) END) AS destination_country,
+               destination_name, start_date, end_date, sale_currency, sale_amount, cost_currency, cost_amount,
+               cost_in_sale_currency, last_update_at, supplier_confirmation, cancellation_date,
+               exchange_rate_microsite, amendment_count, amendment_sale_amount, amendment_cost_amount,
+               agency_management_fee
+        FROM ({inner})""")
 
 
 @dp.materialized_view(

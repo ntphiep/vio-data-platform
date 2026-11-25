@@ -43,6 +43,8 @@ STALE_MINUTES = {
     "accommodations": 15 * 24 * 60,
 }
 UNKNOWN = "-1"
+# Service types without a place in Travel Compositor, excluded from gold_service_without_destination.
+PLACELESS_SERVICE_TYPES = ("itemservice", "manual_accountingAdjustment", "manual_other")
 
 
 def main():
@@ -123,6 +125,7 @@ def main():
     stale = " ".join(f"WHEN '{e}' THEN {m}" for e, m in STALE_MINUTES.items())
     events = f"{c}.ops.pipeline_event_log"
     g, sv = f"{c}.gold", f"{c}.silver"
+    placeless = ",".join(f"'{t}'" for t in PLACELESS_SERVICE_TYPES)
 
     checks = {
         # stage 1: Travel Compositor API -> landing. The latest extract of an entity failed, or its last success
@@ -236,9 +239,11 @@ def main():
             UNION ALL SELECT 'obt rows' FROM (SELECT 1)
               WHERE (SELECT count(*) FROM {g}.obt_booking_service) <> (SELECT count(*) FROM {g}.fact_booking_service)""",
         ),
+        # items (SIM cards ...), accounting adjustments and other manual lines have no place in Travel Compositor
         "gold_service_without_destination": (
             "warn",
-            f"SELECT service_key AS k FROM {g}.fact_booking_service WHERE destination_country IS NULL AND is_active",
+            f"""SELECT service_key AS k FROM {g}.fact_booking_service WHERE destination_country IS NULL AND is_active
+              AND service_type NOT IN ({placeless})""",
         ),
         "gold_supplier_unknown": (
             "warn",
@@ -258,13 +263,19 @@ def main():
             f"""SELECT p.booking_ref AS k FROM {g}.fact_pending_payment p
             LEFT ANTI JOIN {g}.fact_booking b ON b.booking_ref = p.booking_ref""",
         ),
-        # the booking and service price breakdowns of Travel Compositor do not always add up (cross-currency costs)
+        # Travel Compositor booking total = sale of every service, cancelled ones included (a kept cancellation fee),
+        # + the price changes of their amendments + the agency management fee when the booking keeps it at booking
+        # level only. Cents of rounding on amendments are tolerated.
         "gold_booking_total_differs_from_services": (
             "warn",
             f"""SELECT b.booking_ref AS k FROM {g}.fact_booking b
-            JOIN (SELECT booking_ref, sum(sale_amount) AS sale FROM {g}.fact_booking_service GROUP BY 1) s
-              ON s.booking_ref = b.booking_ref
-            WHERE b.is_active AND abs(b.total_price - s.sale) > 0.01""",
+            JOIN (SELECT booking_ref, sum(coalesce(sale_amount, 0) + amendment_sale_amount) AS sale,
+                         sum(agency_management_fee) AS service_fee
+                  FROM {sv}.booking_services GROUP BY 1) s ON s.booking_ref = b.booking_ref
+            JOIN {sv}.bookings sb ON sb.booking_ref = b.booking_ref
+            WHERE b.is_active
+              AND abs(b.total_price - s.sale
+                      - CASE WHEN s.service_fee = 0 THEN coalesce(sb.agency_management_fee, 0) ELSE 0 END) > 0.05""",
         ),
         # stage 4: business_central -> Business Central. Documents wait while the push has not run for too long.
         "e2e_push_stalled": (

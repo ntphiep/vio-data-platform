@@ -51,7 +51,7 @@ bug is fixed by replaying the landed files instead of calling the API again.
 | `local/` | admin scripts run by a person: `store_business_central_token.py` (renews the Business Central sign-in of the push), `extend_number_series.py` |
 | `sql/` | one-time setup: `setup-catalog.sql` (catalog, grants, `ref` tables), `ref-maps-lab-seed.sql` (lab mappings, never used in production) |
 | `tests/` | unit tests of the API client, the backfill planner, the push logic, SQL shared by the pipeline and the push, every statement of `build_business_central_documents` parsed as Databricks SQL, and its document rules run on a local Spark session |
-| `docs/` | `data-flow.drawio`, `star-schema.drawio` and their PNG exports, screenshots of the workspace and Business Central |
+| `docs/` | `data-flow.drawio`, `star-schema.drawio` and their PNG exports, `logo-sources.md`, screenshots of the workspace and Business Central |
 | `.github/workflows/ci.yml`, `.githooks/pre-push` | the same checks in GitHub Actions and before every local push |
 
 ## Unity Catalog layout
@@ -344,7 +344,7 @@ The backfill job only lands files and never moves the watermark; the next schedu
 never update the pipeline or rebuild `business_central` at the same time, and a failed month is re-read with Repair
 run.
 
-![One run of vio_travel_ingest_transform_publish with its 4 tasks](docs/job-run.png)
+![One run of vio_travel_ingest_transform_publish before push_to_business_central and build_business_central_documents were added](docs/job-run.png)
 
 ## Data quality
 

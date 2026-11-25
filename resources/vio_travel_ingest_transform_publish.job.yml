@@ -71,13 +71,15 @@ resources:
                          "--rebuild", "{{job.parameters.rebuild}}"]
         # Not part of the write-audit-publish of build_business_central_tables: local/push_to_business_central.py does
         # not read these tables, so its blocking checks fail this task only. ALL_DONE: the documents are built from
-        # bronze, which a failed draft-invoice build leaves as it is.
+        # bronze, which a failed draft-invoice build leaves as it is. No retry: the documents are append-only, so a
+        # retry after a blocking check reads the same bookings and fails the same way; the next hourly run reads them
+        # again.
         - task_key: build_business_central_documents
           depends_on:
             - task_key: build_business_central_tables
           run_if: ALL_DONE
           environment_key: default
-          max_retries: 1
+          max_retries: 0
           spark_python_task:
             python_file: ../src/build_business_central_documents.py
             parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}",

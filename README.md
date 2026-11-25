@@ -50,7 +50,7 @@ bug is fixed by replaying the landed files instead of calling the API again.
 | `dashboards/build_dashboard.py`, `genie/build_genie_space.py` | generators of the dashboard and Genie JSON; edit the script, never the JSON |
 | `local/` | the Business Central push, its config, systemd units, `extend_number_series.py` |
 | `sql/` | one-time setup: `setup-catalog.sql` (catalog, grants, `ref` tables), `ref-maps-lab-seed.sql` (lab mappings, never used in production) |
-| `tests/` | unit tests of the API client, the backfill planner, the push logic, SQL shared by the pipeline and the push, and every statement of `build_business_central_documents` parsed as Databricks SQL |
+| `tests/` | unit tests of the API client, the backfill planner, the push logic, SQL shared by the pipeline and the push, every statement of `build_business_central_documents` parsed as Databricks SQL, and its document rules run on a local Spark session |
 | `docs/` | `data-flow.drawio`, `star-schema.drawio` and their PNG exports, screenshots of the workspace and Business Central |
 | `.github/workflows/ci.yml`, `.githooks/pre-push` | the same checks in GitHub Actions and before every local push |
 
@@ -222,24 +222,47 @@ sheet `Scenarios`). Task `build_business_central_documents` builds them in three
 | Table | Grain | Built |
 |---|---|---|
 | `booking_versions` | one DWH version of a booking: a landing in `bronze.tc_bookings` whose fields sent to Business Central differ from the version before | incrementally, MERGE of the bronze rows landed since the last build |
-| `sales_documents` | one Invoice or Credit Memo of a version, lines in column `sales_lines` | rebuilt from `booking_versions` and the current mappings |
-| `purchase_documents` | one Invoice or Credit Memo of a service in a version, line in column `purchase_lines` | rebuilt the same way |
+| `sales_documents` | one Invoice or Credit Memo, lines in column `sales_lines` | append-only: new documents are MERGEd in, an emitted document is never rewritten |
+| `purchase_documents` | one Invoice or Credit Memo of a service, line in column `purchase_lines` | append-only, the same way |
 
 | Change of a booking or service | Sales documents | Purchase documents |
 |---|---|---|
 | first version with a positive total (BOOKED or RQ; a service: BOOKED) | Invoice with a Deposit line, a Balance line due on `payment.deferredLimitDate` and a comment line listing the services | Invoice |
 | total or cost up or down | Invoice or Credit Memo for the difference | Invoice or Credit Memo for the difference |
-| booking or service cancelled (a service also when it leaves the booking) | Credit Memo for the amount invoiced, Invoice for the fee kept | Credit Memo for the difference |
-| customer, vendor or currency changes | Credit Memo for the amount invoiced, new Invoice | Credit Memo, new Invoice |
+| booking or service cancelled (a service also when it leaves the booking) | Credit Memo for the amount invoiced, Invoice for the fee kept | Credit Memo for the cost invoiced, Invoice for the cost Travel Compositor keeps (scenario PO-CAN-02) |
+| customer, vendor or currency changes, or a held document can be released | Credit Memo for the amount invoiced, new Invoice | Credit Memo, new Invoice |
 
-The IntegrationKey is the booking reference (a service reference for purchases) and the DWH version, column
-`integration_key`. A version starts when the hash of the fields sent to Business Central changes; a landing older than
-one already read is ignored, so a rebuild (job parameter `rebuild=true`) gives the same versions as the incremental
-builds. Invoice numbers follow the AR Masterfile format YYDDDNNN: year, day of the posting date, sequence of the day.
-The signed documents of a booking always add up to its total in the last version sent, and those of a service to its
-cost; blocking checks test that. The booking total of Travel Compositor is the sale of every service, cancelled ones
-with a kept fee included, plus the price changes of their amendments and the agency management fee when the booking
-keeps it at booking level, so the documents use that total and the purchase documents add the amendment costs.
+Each run compares the versions of a booking after the last one that produced a document with what the emitted
+documents add up to (amount, customer or vendor, currency, hold reason), and adds only the documents that bring
+Business Central to the current version. A run reads the bookings with a version landed after the watermark of the
+last successful build (table property `vio.documents_built_through` of `booking_versions`). A change of
+`ref.customer_map`, `ref.vendor_map`, `ref.umbrella_agency`, `silver.agencies` or `silver.suppliers` makes the run read
+every booking: a mapping that changes the customer or vendor of emitted documents produces a Credit Memo and a new
+Invoice dated the build day, and the emitted documents keep their values. A run that finds no new landing and no
+mapping change does nothing. Codes of `ref.business_central_code_map` apply to documents emitted after the code is added.
+
+The IntegrationKey, column `integration_key`, is unique per document: booking reference, DWH version and document
+sequence for sales (`EXA-28467-3-1`), Service Reference, DWH version and document sequence for purchases
+(`HOTEL-EXA-35844-6-2-1`). The Service Reference is the service category (an `M` prefix for a manual line), the
+booking reference and the Travel Compositor line id. A version starts when the hash of the fields sent to Business
+Central changes; a landing older than one already read is ignored. The Invoice No. follows the AR Masterfile format
+YYDDDNNN and is given once, when the invoice is emitted: day of the build in Asia/Ho_Chi_Minh, then the next number of
+that day. Credit memos and held invoices have no number. The signed documents of a booking always add up to its total
+in the last version sent, and those of a service to its cost; blocking checks test that, and that no emitted invoice
+number changed since the previous version of `sales_documents` (Delta time travel). The booking total of Travel
+Compositor is the sale of every service, cancelled ones with a kept fee included, plus the price changes of their
+amendments and the agency management fee when the booking keeps it at booking level, so the documents use that total
+and the purchase documents add the amendment costs.
+
+Job parameter `rebuild=true` recomputes `booking_versions` from the whole of bronze and reads every booking. It keeps
+the emitted documents and their numbers and adds only the documents that are missing. The tables written before the
+documents became append-only have other columns, and the task stops with an error until they are dropped:
+
+```sql
+DROP TABLE vio_travel.business_central.sales_documents;
+DROP TABLE vio_travel.business_central.purchase_documents;
+-- then run the job once with --params rebuild=true
+```
 
 Codes Travel Compositor does not hold come from table `ref.business_central_code_map`: the item per service type
 (`ITEM`), the salesperson or purchaser code and the business unit per booking creator (`SALESPERSON`,
@@ -272,14 +295,16 @@ Fields of the partner specification in `sales_documents` and `purchase_documents
 
 | Partner field | Column | Source |
 |---|---|---|
-| IntegrationKey, document type | `integration_key`, `dwh_version`, `document_type` | booking reference or service reference and DWH version |
-| No. (invoice), posting date | `invoice_no`, `posting_date` | YYDDDNNN; creation date, change date or cancellation date |
+| IntegrationKey, document type | `integration_key`, `dwh_version`, `doc_seq`, `document_type` | booking reference or Service Reference, DWH version, document sequence |
+| No. (invoice), posting date | `invoice_no`, `posting_date` | YYDDDNNN of the build day; creation date, change date, cancellation date or build day |
+| Currency Code | `currency_code`, `booking_currency`, `cost_currency` | blank for USD; the Travel Compositor currency in its own column |
 | Deposit and Balance lines, line due date, RecID | `sales_lines` | `payment.amount`, the rest of the total, `payment.deferredLimitDate`, booking `id` |
 | Destinations, comment line | `destinations`, `sales_lines` | active hotel stays in check-in order (`1: Tokyo, 2: Kyoto`); services and start dates |
 | Booking Total Amount, cancellation date, main booking | `booking_total_amount`, `cancellation_date`, `main_booking` | booking total, service `cancelationDate`, `bookingAssociatedTo` |
 | Salesperson Code, E-Mail | `salesperson_code`, `sell_to_email` | `ref.business_central_code_map`, `user.email` |
-| Paid Amount, payment method | `paid_amount`, `payment_method` | payments with payment system `TRUST_MY_TRAVEL` |
-| Service Reference, Vendor Order No., Service Total Cost, Currency Factor | `your_reference`, `vendor_order_no`, `service_total_cost`, `currency_factor` | service id and type code, supplier confirmation, cost plus amendments, `exchangeRateMicrosite` |
+| Paid Amount, payment method | `paid_amount`, `payment_method` | NULL until Vio confirms which payment system is Trust My Travel |
+| Service Reference, Vendor Order No., Service Total Cost, Currency Factor | `service_reference`, `vendor_order_no`, `service_total_cost`, `currency_factor` | category, booking reference and line id, supplier confirmation, cost plus amendments, `exchangeRateMicrosite` |
+| Description 2 of the purchase line | `purchase_lines` | rest of the description and the service destination name |
 
 Travel Compositor does not hold the agency currency and rate, the business unit of a user, supplier payment terms,
 vendor invoice and credit note numbers, the TCODE (credit or refund), the number format of credit memos and purchase
@@ -299,7 +324,7 @@ says why; the values come from Finance or the partner.
 
 Task `extract_travel_compositor` retries twice, 5 minutes apart. The pipeline retries a failed update once by itself
 (pipeline setting `pipelines.numUpdateRetryAttempts`), so its task has no retry. `build_business_central_tables` retries
-once. The job times out after 45 minutes, and a run that starts while another is active waits in the queue.
+once. `build_business_central_documents` does not retry: a rerun reads the same bookings and gives the same result. The job times out after 45 minutes, and a run that starts while another is active waits in the queue.
 
 The backfill job only lands files and never moves the watermark; the next scheduled run loads them. So the two jobs
 never update the pipeline or rebuild `business_central` at the same time, and a failed month is re-read with Repair
@@ -313,8 +338,8 @@ run.
 |---|---|---|
 | pipeline expectations (`bronze_`, `silver_`) | keys present, dates ordered, amounts present, payload parsed | rows without a key are dropped, other rules warn; counts copied into `ops.dq_results` |
 | `build_business_central_tables`, severity `block` | unique document keys, a customer or vendor and a currency on every document, one currency per invoice, Business Central field lengths | nothing is published, and the push keeps the previous build |
-| `build_business_central_documents`, severity `block` | versions numbered 1 to n, unique document keys, invoice numbers of 8 digits and unique, documents adding up to the booking total and the service cost, deposit and balance adding up to the invoice | the task fails after writing its results; the next run rebuilds the documents |
-| `build_business_central_documents`, severity `warn` | documents held or with an unmapped item, invoices without destinations, payment split that differs from the total, amendment costs in another currency | recorded and shown on the dashboard |
+| `build_business_central_documents`, severity `block` | versions numbered 1 to n, unique IntegrationKey, invoice numbers of 8 digits and unique, emitted invoice numbers unchanged, documents adding up to the booking total and the service cost, deposit and balance adding up to the invoice | the task fails after writing its results and keeps its watermark, so the next run reads the same bookings again |
+| `build_business_central_documents`, severity `warn` | documents held or with an unmapped item, invoices without destinations or start date, cancellations without a cancellation date, cancelled services that keep a cost, payment split that differs from the total, amendment costs in another currency | recorded and shown on the dashboard |
 | `build_business_central_tables` and `check_data_quality`, severity `warn` | held documents, totals that differ from lines, unknown service arrays, unknown suppliers, overdue payments, sales waiting for the push | recorded and shown on the dashboard |
 | `check_data_quality`, severity `alert` (`gold_`, `e2e_`) | gold key uniqueness, fact grain, orphan facts, totals against silver; extract failing or stale per entity, no booking updated in Travel Compositor for 48 hours, pipeline failed or stale, `business_central` behind silver, push stalled | the task fails and the failure e-mail goes out |
 | anomaly detection on `silver`, `gold`, `business_central` | freshness and completeness of every table, learned from its history | Unity Catalog health indicator and the system table `system.data_quality_monitoring.table_results` |
@@ -393,12 +418,12 @@ are on.
 
 ## Development
 
-Development needs Python 3.11 or later, [uv](https://docs.astral.sh/uv/), the Databricks CLI (CI uses v1.26.0)
-logged in to the workspace, and the Azure CLI for the push.
+Development needs Python 3.11 or later, [uv](https://docs.astral.sh/uv/), Java 17 or later for the local Spark tests,
+the Databricks CLI (CI uses v1.26.0) logged in to the workspace, and the Azure CLI for the push.
 
 ```bash
 uvx ruff check . && uvx ruff format --check .
-uv run --no-project --with pytest --with requests --with databricks-sdk --with sqlglot pytest -q tests
+uv run --no-project --with pytest --with requests --with databricks-sdk --with sqlglot --with pyspark==4.0.1 pytest -q tests
 git config core.hooksPath .githooks        # run the same checks before every git push
 databricks bundle validate -t prod
 ```
@@ -427,7 +452,8 @@ databricks bundle run vio_travel_backfill_bookings -t prod --params backfill_fro
 # rebuild silver and gold from bronze; bronze and snapshot history are kept
 databricks pipelines start-update <pipeline_id> --full-refresh
 
-# rebuild business_central after a code change although silver did not change
+# rebuild business_central after a code change although silver did not change; booking versions are recomputed,
+# emitted sales and purchase documents stay
 databricks bundle run vio_travel_ingest_transform_publish -t prod --params rebuild=true
 
 # regenerate the dashboard or Genie space after editing their scripts
@@ -461,9 +487,10 @@ IDs only, no credential.
   `sales_documents` and `purchase_documents` wait for the custom API pages of the implementation partner.
 - Booking versions start with the first landing in `bronze.tc_bookings`: a change made before the lab loaded a booking,
   or between two reads of it, is not a version of its own.
-- Invoice numbers are recomputed by every build. They stay the same while versions are only added, but a change of a
-  mapping that changes a customer or vendor, or a rebuild, can renumber them; they become final only when a push
-  records them.
+- An emitted document is never corrected in place: a mapping change produces a Credit Memo and a new Invoice, and a
+  held document is replaced the same way once it can be released. Codes of `ref.business_central_code_map` are not
+  corrected on emitted documents.
 - `payment.amount` plus `payment.deferredAmount` differs from the booking total on some bookings, so the deposit line
-  takes `payment.amount` and the balance line the rest. Paid Amount uses payments through Trust My Travel only.
+  takes `payment.amount` and the balance line the rest. Paid Amount stays NULL: the live bookings show payment systems
+  DEPOSIT and REPAYD only, and Vio has not said which marks Trust My Travel.
 - The push depends on a workstation and a delegated login; production needs an app registration and a job.

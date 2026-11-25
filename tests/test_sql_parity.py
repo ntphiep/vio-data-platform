@@ -51,3 +51,18 @@ def test_setup_catalog_creates_the_code_map_like_the_task():
     assert [line.strip().rstrip(",") for line in ddl.strip().splitlines()] == [
         f"{n} {t} COMMENT '{c}'" for n, t, c in columns
     ]
+
+
+def test_build_business_central_documents_country_fallback_matches_silver():
+    """destination_country of silver.booking_services falls back to the first service of the booking (start date, then
+    service id) with the same destination name; booking_versions applies the same rule to its services. The rule
+    itself runs in tests/test_business_central_documents_spark.py."""
+    silver = (SRC / "build_bronze_silver_gold" / "silver.py").read_text()
+    assert "PARTITION BY booking_ref, lower(destination_name) ORDER BY start_date, service_id" in " ".join(
+        silver.split()
+    )
+    docs = (SRC / "build_business_central_documents.py").read_text()
+    assert '{country_fallback_sql("ls.services")} AS services' in docs
+    fallback = docs.split("def country_fallback_sql", 1)[1].split("\ndef ", 1)[0]
+    assert "lower(y.destination_name) = lower(x.destination_name)" in fallback
+    assert "named_struct('d', y.start_date, 'id', y.service_id, 'c', y.destination_country)" in fallback

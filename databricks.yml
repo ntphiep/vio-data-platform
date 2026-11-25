@@ -39,6 +39,9 @@ targets:
   prod:
     mode: production
     default: true
+    # production mode refuses a deploy from any other branch (override: bundle deploy --force)
+    git:
+      branch: main
     workspace:
       host: https://dbc-b0a66a17-fa1b.cloud.databricks.com
       root_path: /Workspace/Users/${workspace.current_user.userName}/vio-data-platform/prod

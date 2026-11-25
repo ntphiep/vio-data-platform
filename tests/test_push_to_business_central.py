@@ -1,9 +1,11 @@
-"""Unit tests for the Business Central push helpers (no network, no Databricks).
+"""Unit tests of task push_to_business_central and local/extend_number_series.py (no network, no Databricks).
 Run: uv run --no-project --with pytest --with requests python -m pytest tests"""
 
+import base64
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -12,9 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "local"))
 sys.path.insert(0, str(ROOT / "src"))
 import extend_number_series as ns  # noqa: E402
-import push_to_business_central as m  # noqa: E402
 
 import build_business_central_tables  # noqa: E402
+import push_to_business_central as m  # noqa: E402
 
 
 class Resp:
@@ -49,12 +51,22 @@ class Session:
         return o
 
 
-def bc(outcomes, monkeypatch):
-    monkeypatch.setattr(m.BC, "_token", lambda self: self.s.headers.update({"Authorization": "Bearer t"}))
+class Token:
+    """Token function for BC that records whether each call forced a renewal."""
+
+    def __init__(self):
+        self.forced = []
+
+    def __call__(self, force=False):
+        self.forced.append(force)
+        return f"t{len(self.forced)}"
+
+
+def bc(outcomes, monkeypatch=None, token=None):
     sleeps = []
     cfg = {"bc_environment": "Production", "bc_company": "My Company", "bc_tenant": "x", "bc_local_currency": "AUD"}
     s = Session([Resp(200, {"value": [{"id": "c1", "name": "My Company"}]})] + outcomes)
-    client = m.BC(cfg, session=s, sleep=sleeps.append)
+    client = m.BC(cfg, token=token or Token(), session=s, sleep=sleeps.append)
     s.calls.clear()
     s.log.clear()
     return client, s, sleeps
@@ -107,8 +119,22 @@ def test_post_network_error_is_raised_not_retried(monkeypatch):
 
 
 def test_401_renews_token_once(monkeypatch):
-    client, s, sleeps = bc([Resp(401), Resp(200)], monkeypatch)
+    token = Token()
+    client, s, sleeps = bc([Resp(401), Resp(200)], monkeypatch, token)
+    token.forced.clear()
     assert client.call("GET", "https://x/a").status_code == 200 and sleeps == []
+    assert token.forced == [False, True]
+    client, s, _ = bc([Resp(401), Resp(401)], monkeypatch)
+    assert client.call("GET", "https://x/a").status_code == 401 and s.calls == ["GET", "GET"]
+
+
+def test_every_request_carries_the_current_token(monkeypatch):
+    client, s, _ = bc([Resp(200), Resp(200)], monkeypatch)
+    seen = []
+    s.request = lambda method, url, **kw: seen.append(s.headers["Authorization"]) or Resp(200)
+    client.call("GET", "https://x/a")
+    client.call("GET", "https://x/b")
+    assert seen == ["Bearer t2", "Bearer t3"]
 
 
 def test_find_rejects_duplicates(monkeypatch):
@@ -536,51 +562,179 @@ def test_data_quality_uses_the_push_result_groups():
     assert dq.MAX_FAILURES == m.MAX_FAILURES
 
 
-# ------------------------------------------------------------------ timer-mode monitoring
-def run_(start_min_ago, result=None, message=""):
-    from types import SimpleNamespace as NS
+# ------------------------------------------------------------------ check_data_quality defaults
+def test_data_quality_defaults_follow_the_push_config():
+    import check_data_quality as dq
 
-    state = NS(result_state=NS(value=result) if result else None, state_message=message)
-    return NS(run_id=start_min_ago, start_time=(10_000 - start_min_ago) * 60000, state=state)
-
-
-def test_job_problem_reports_a_stopped_job_with_the_same_text_on_every_tick():
-    runs = [run_(200, "SUCCESS")]
-    first = m.job_problem(runs, 10_000 * 60000)
-    assert "no run of the job started since" in first
-    assert m.job_problem(runs, 10_005 * 60000) == first
+    src = (ROOT / "src" / "check_data_quality.py").read_text()
+    cfg = m.load_cfg()
+    assert f"date_sub(current_date(), {30})" in cfg["scope_sql"]
+    assert '"--push_scope_days", type=int, default=30' in src
+    assert f'"--max_removals_per_run", type=int, default={cfg["max_removals_per_run"]}' in " ".join(src.split())
+    assert "e2e_push_removals_over_limit" in src and dq.CLOSED
 
 
-def test_job_problem_reports_repeated_failures_and_ignores_a_running_run():
-    runs = [run_(5), run_(65, "FAILED", "check_data_quality"), run_(125, "FAILED"), run_(185, "FAILED")]
-    assert "last 3 runs of the job failed: check_data_quality" in m.job_problem(runs, 10_000 * 60000)
-    runs[2] = run_(125, "SUCCESS")
-    assert m.job_problem(runs, 10_000 * 60000) is None
+# ------------------------------------------------------------------ Business Central sign-in
+class Secrets:
+    """Fake SecretsAPI: get_secret returns the value base64-encoded, like the Databricks SDK."""
+
+    def __init__(self, value):
+        self.value, self.puts, self.gets = value, [], 0
+
+    def get_secret(self, scope, key):
+        assert (scope, key) == ("vio-business-central", "refresh_token")
+        self.gets += 1
+        return SimpleNamespace(key=key, value=base64.b64encode(self.value.encode()).decode())
+
+    def put_secret(self, scope, key, string_value):
+        assert (scope, key) == ("vio-business-central", "refresh_token")
+        self.puts.append(string_value)
+        self.value = string_value
 
 
-def test_notify_on_change_notifies_once_per_state(monkeypatch):
-    sent = []
-    monkeypatch.setattr(m, "notify", lambda title, body: sent.append(body))
-    state = {}
-    for problem in ("down", "down", None, None):
-        m.notify_on_change(state, "k", problem, "t")
-    assert sent == ["down", "back to normal"] and state["k"] is None
+class App:
+    """Fake msal PublicClientApplication: each refresh returns the next answer and records the refresh token used."""
+
+    def __init__(self, answers):
+        self.answers, self.used = list(answers), []
+
+    def acquire_token_by_refresh_token(self, refresh_token, scopes):
+        assert scopes == m.BC_SCOPE
+        self.used.append(refresh_token)
+        return self.answers.pop(0)
 
 
-def test_unavailable_warehouse_raises_warehouse_unavailable(monkeypatch):
-    import types
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
 
-    sql_mod = types.ModuleType("databricks.sdk.service.sql")
-    sql_mod.StatementState = types.SimpleNamespace(PENDING="PENDING", RUNNING="RUNNING", SUCCEEDED="SUCCEEDED")
-    for name in ("databricks", "databricks.sdk", "databricks.sdk.service"):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-    monkeypatch.setitem(sys.modules, "databricks.sdk.service.sql", sql_mod)
+    def __call__(self):
+        return self.now
 
-    class Ex:
-        def execute_statement(self, **kw):
-            raise RuntimeError("Sorry, cannot run the resource because you have hit your free daily limit.")
 
-    db = m.DBX.__new__(m.DBX)
-    db.w, db.cfg = type("W", (), {"statement_execution": Ex()})(), {"warehouse_id": "w"}
-    with pytest.raises(m.WarehouseUnavailable):
-        db.q("SELECT 1")
+def test_refresh_token_is_rotated_into_the_secret():
+    secrets, clock = Secrets("RT0"), Clock()
+    app = App(
+        [
+            {"access_token": "A1", "refresh_token": "RT1", "expires_in": 3600},
+            {"access_token": "A2", "refresh_token": "RT2", "expires_in": 3600},
+        ]
+    )
+    auth = m.RefreshTokenAuth("tenant", secrets=secrets, app=app, clock=clock)
+    assert auth.token() == "A1" and secrets.puts == ["RT1"]
+    assert auth.token() == "A1" and app.used == ["RT0"]
+    assert auth.token(force=True) == "A2"
+    assert app.used == ["RT0", "RT1"] and secrets.puts == ["RT1", "RT2"] and secrets.gets == 1
+
+
+def test_unchanged_refresh_token_is_not_written_again():
+    secrets = Secrets("RT0")
+    app = App([{"access_token": "A1", "refresh_token": "RT0", "expires_in": 3600}])
+    assert m.RefreshTokenAuth("t", secrets=secrets, app=app, clock=Clock()).token() == "A1"
+    assert secrets.puts == []
+
+
+def test_access_token_is_renewed_before_it_expires():
+    clock = Clock()
+    app = App(
+        [
+            {"access_token": "A1", "refresh_token": "RT1", "expires_in": 4000},
+            {"access_token": "A2", "refresh_token": "RT2", "expires_in": 4000},
+        ]
+    )
+    auth = m.RefreshTokenAuth("t", secrets=Secrets("RT0"), app=app, clock=clock)
+    assert auth.token() == "A1"
+    clock.now += 4000 - m.RENEW_BEFORE_SECONDS - 1
+    assert auth.token() == "A1"
+    clock.now += 1
+    assert auth.token() == "A2" and app.used == ["RT0", "RT1"]
+
+
+def test_refused_refresh_token_names_the_renewal_script_and_hides_the_token():
+    secrets = Secrets("SECRET-RT")
+    app = App([{"error": "invalid_grant", "error_description": "AADSTS700082: The refresh token has expired.\nTrace"}])
+    auth = m.RefreshTokenAuth("t", secrets=secrets, app=app, clock=Clock())
+    with pytest.raises(RuntimeError) as e:
+        auth.token()
+    msg = str(e.value)
+    assert "local/store_business_central_token.py" in msg and "invalid_grant" in msg and "AADSTS700082" in msg
+    assert "SECRET-RT" not in msg and "Trace" not in msg and secrets.puts == []
+
+
+def test_long_run_renews_the_token_inside_bc_calls():
+    clock = Clock()
+    app = App(
+        [
+            {"access_token": "A1", "refresh_token": "RT1", "expires_in": 3600},
+            {"access_token": "A2", "refresh_token": "RT2", "expires_in": 3600},
+            {"access_token": "A3", "refresh_token": "RT3", "expires_in": 3600},
+        ]
+    )
+    secrets = Secrets("RT0")
+    auth = m.RefreshTokenAuth("t", secrets=secrets, app=app, clock=clock)
+    client, s, _ = bc([], token=auth.token)
+    seen = []
+    s.request = lambda method, url, **kw: seen.append(s.headers["Authorization"]) or Resp(200)
+    client.call("GET", "https://x/a")
+    clock.now += 3600
+    client.call("GET", "https://x/b")
+    # a 401 renews at once although the token has not expired
+    answers = [Resp(401), Resp(200)]
+    s.request = lambda method, url, **kw: seen.append(s.headers["Authorization"]) or answers.pop(0)
+    assert client.call("GET", "https://x/c").status_code == 200
+    assert seen == ["Bearer A1", "Bearer A2", "Bearer A2", "Bearer A3"]
+    assert secrets.value == "RT3"
+
+
+# ------------------------------------------------------------------ run: result rows and failure count
+class FakeDB:
+    """Answers the queries of run() by a keyword in the SQL and records the INSERT statements."""
+
+    def __init__(self, answers):
+        self.answers, self.sql = answers, []
+
+    def q(self, sql):
+        self.sql.append(sql)
+        for key, rows in self.answers.items():
+            if key in sql:
+                return rows
+        return []
+
+
+def test_run_skips_the_removal_step_over_the_limit_and_counts_failures(monkeypatch):
+    removed = [{"doc_type": "sales", "doc_key": f"OLD{n}", "attempt_result": "CREATED"} for n in range(3)]
+    db = FakeDB(
+        {
+            "FROM vio_travel.ops.publish": [
+                {"run_id": "1", "versions": json.dumps(dict.fromkeys(build_business_central_tables.TABLES, 4))}
+            ],
+            "LEFT ANTI JOIN (SELECT 'sales'": removed,
+            "SELECT i.*": [
+                doc(
+                    external_document_number="B1",
+                    customer_number="AG1",
+                    currency_code="AUD",
+                    invoice_date="2026-11-20",
+                    last_update_at="2026-11-20 08:00:00",
+                )
+            ],
+        }
+    )
+    cfg = {
+        "catalog": "vio_travel",
+        "bc_company": "My Company",
+        "bc_local_currency": "AUD",
+        "max_removals_per_run": 2,
+        "sales_gl_account": "4350",
+        "customer_setup": {},
+        "vendor_setup": {},
+    }
+    client = SimpleNamespace(
+        ensure_exchange_rates=lambda needs, errors, fallback: ([], set()), has_currency=lambda code: True
+    )
+    monkeypatch.setattr(m, "push_document", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(m, "remove_document", lambda *a: pytest.fail("removal guard did not stop the step"))
+    assert m.run(cfg, db, "42", bc=client) == 1
+    inserts = [s for s in db.sql if s.startswith("INSERT INTO vio_travel.ops.business_central_sync")]
+    assert len(inserts) == 1 and "'sales', 'B1', 'H1', 'My Company', NULL, NULL, 'FAILED', 'boom'" in inserts[0]
+    assert "VERSION AS OF 4" in "".join(db.sql)

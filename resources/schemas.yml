@@ -22,7 +22,7 @@ resources:
     business_central:
       catalog_name: ${var.catalog}
       name: business_central
-      comment: Integration output shaped for the Business Central API; read by local/push_to_business_central.py. Rebuilt each run.
+      comment: Integration output shaped for the Business Central API; read by task push_to_business_central. Rebuilt each run.
     ref:
       catalog_name: ${var.catalog}
       name: ref

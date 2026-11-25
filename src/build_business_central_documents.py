@@ -32,7 +32,7 @@ watermark of the last successful build (table property DOCUMENTS_WATERMARK of bo
 (YYDDDNNN) is given once, when the invoice is emitted: day of the build in Asia/Ho_Chi_Minh, then the next number of
 that day. The signed amounts of the documents of a booking or service add up to its current total; blocking checks
 test that, the keys and the invoice numbers, and that no emitted invoice number changed since the previous version
-of the table. The tables are not read by local/push_to_business_central.py yet.
+of the table. The tables are not read by task push_to_business_central yet.
 
 Versions (DWH version): the bronze rows of a booking are read in landing order (ingested_at, then lastUpdateDate, then
 file). A row whose lastUpdateDate is older than one landed before it is ignored, so a late or replayed page never

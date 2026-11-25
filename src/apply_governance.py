@@ -5,7 +5,7 @@ Idempotent; runs after each deploy and weekly, so tags, table comments and grant
 - Masking: function governance.mask_pii hides personal values unless the reader is in the group vio_pii_readers.
   Every silver table (current and history) and gold.dim_user declares the mask in its pipeline schema, together
   with its column comments, so this job creates the function and sets no mask on pipeline tables. The tables of
-  business_central are not masked: local/push_to_business_central.py must send the real e-mail and address to Business Central,
+  business_central are not masked: task push_to_business_central must send the real e-mail and address to Business Central,
   and only the service principal and the catalog owner can read that schema.
 - Tags: table tag contains_pii and column tag pii (email, phone, name, address) on every personal column, so the
   columns can be found with information_schema.column_tags.
@@ -77,8 +77,8 @@ TABLE_COMMENTS = {
     "ops.build_state": "Content token of the inputs per task build; build_business_central_tables and build_business_central_documents skip the rebuild when it is unchanged.",
     "ops.dq_results": "Data-quality results per job run: check name, severity, failed rows, sample keys.",
     "ops.publish": "Write-audit-publish log: business_central table versions published after the blocking checks "
-    "passed; local/push_to_business_central.py reads the tables AS OF the latest row.",
-    "ops.business_central_sync": "One row per document pushed by local/push_to_business_central.py to Business Central: key, payload hash, "
+    "passed; task push_to_business_central reads the tables AS OF the latest row.",
+    "ops.business_central_sync": "One row per document pushed by task push_to_business_central to Business Central: key, payload hash, "
     "company, Business Central id and number, result, error.",
     "ref.umbrella_agency": "Agencies whose real customer is the agency booking reference of each booking, mapped by "
     "ref.customer_map. Maintained by Vio Finance.",

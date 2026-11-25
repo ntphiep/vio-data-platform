@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 uvx ruff check .
 uvx ruff format --check .
-uv run --no-project --with pytest --with requests --with databricks-sdk --with sqlglot --with pyspark==4.0.1 pytest -q tests
+uv run --no-project --with pytest --with requests --with databricks-sdk --with sqlglot --with pyspark==4.0.1 --with msal pytest -q tests
 python3 dashboards/build_dashboard.py && git diff --exit-code dashboards/
 python3 genie/build_genie_space.py && git diff --exit-code genie/
 if command -v databricks >/dev/null; then databricks bundle validate -t prod >/dev/null; fi

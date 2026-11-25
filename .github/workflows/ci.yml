@@ -25,7 +25,7 @@ jobs:
       - name: ruff format
         run: uvx ruff@0.17.6 format --check .
       - name: unit tests
-        run: uv run --no-project --with pytest --with requests --with databricks-sdk==0.171.0 --with sqlglot==30.35.0 --with pyspark==4.0.1 pytest -q tests
+        run: uv run --no-project --with pytest --with requests --with databricks-sdk==0.171.0 --with sqlglot==30.35.0 --with pyspark==4.0.1 --with msal==1.39.0 pytest -q tests
       - name: dashboard JSON matches its generator
         run: python3 dashboards/build_dashboard.py && git diff --exit-code dashboards/
       - name: Genie space JSON matches its generator

@@ -5,11 +5,11 @@ resources:
       description: >-
         Travel Compositor API -> volume raw.landing (extract_travel_compositor) -> pipeline vio_travel_build_bronze_silver_gold (bronze, silver
         with history, gold star schema read by the dashboard vio_travel_overview and the Genie space) -> Business
-        Central integration tables in business_central (build_business_central_tables, published only after its blocking checks pass,
-        then pushed by local/push_to_business_central.py outside Databricks because it uses a delegated Azure CLI login) ->
-        posted sales and purchase documents per booking version in the shape of the implementation partner specification
-        (build_business_central_documents, not pushed yet). The last task, check_data_quality, records pipeline
-        expectations, gold checks and end-to-end freshness.
+        Central integration tables in business_central (build_business_central_tables, published only after its blocking checks pass)
+        -> draft invoices in Business Central (push_to_business_central, signed in with the delegated refresh token in
+        secret scope vio-business-central); in parallel, posted sales and purchase documents per booking version in
+        the shape of the implementation partner specification (build_business_central_documents, not pushed yet).
+        The last task, check_data_quality, records pipeline expectations, gold checks and end-to-end freshness.
       max_concurrent_runs: 1
       run_as:
         service_principal_name: ${var.pipeline_sp}
@@ -38,12 +38,23 @@ resources:
           default: ""
         - name: rebuild
           default: "false"
+        # results that push_to_business_central sends again although the payload did not change, e.g. FAILED
+        - name: push_retry
+          default: ""
       environments:
         - environment_key: default
           spec:
             environment_version: "2"
             dependencies:
               - requests
+        # environment version 2 ships databricks-sdk 0.40.0 and no msal
+        - environment_key: push_to_business_central
+          spec:
+            environment_version: "2"
+            dependencies:
+              - msal==1.39.0
+              - databricks-sdk==0.171.0
+              - requests==2.34.2
       tasks:
         - task_key: extract_travel_compositor
           environment_key: default
@@ -69,8 +80,21 @@ resources:
             python_file: ../src/build_business_central_tables.py
             parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}",
                          "--rebuild", "{{job.parameters.rebuild}}"]
-        # Not part of the write-audit-publish of build_business_central_tables: local/push_to_business_central.py does
-        # not read these tables, so its blocking checks fail this task only. ALL_DONE: the documents are built from
+        # Runs only after build_business_central_tables succeeded, and reads the tables AS OF the versions it published
+        # in ops.publish. No retry: a POST that failed may have been committed, and the next hourly run finds the
+        # document by its key; a refused refresh token fails the same way on a retry.
+        - task_key: push_to_business_central
+          depends_on:
+            - task_key: build_business_central_tables
+          environment_key: push_to_business_central
+          max_retries: 0
+          spark_python_task:
+            python_file: ../src/push_to_business_central.py
+            parameters: ["--catalog", "${var.catalog}", "--run_id", "{{job.run_id}}",
+                         "--config", "${workspace.file_path}/src/push_to_business_central.json",
+                         "--retry", "{{job.parameters.push_retry}}"]
+        # Not part of the write-audit-publish of build_business_central_tables: push_to_business_central does not read
+        # these tables, so their blocking checks fail this task only. ALL_DONE: the documents are built from
         # bronze, which a failed draft-invoice build leaves as it is. No retry: the documents are append-only, so a
         # retry after a blocking check reads the same bookings and fails the same way; the next hourly run reads them
         # again.
@@ -87,6 +111,7 @@ resources:
         - task_key: check_data_quality
           depends_on:
             - task_key: build_business_central_documents
+            - task_key: push_to_business_central
           run_if: ALL_DONE          # also after a failed task, so the end-to-end state is always recorded
           environment_key: default
           spark_python_task:

@@ -37,7 +37,7 @@ Central trial. The Travel Compositor API is only read: GET requests and the auth
 | Integration tables | task `build_business_central_tables` | `src/build_business_central_tables.py` | schema `business_central`, published versions in `ops.publish` |
 | Integration documents | task `build_business_central_documents` | `src/build_business_central_documents.py` | booking versions, posted sales and purchase documents in `business_central` |
 | Checks | task `check_data_quality` | `src/check_data_quality.py` | `ops.dq_results` |
-| Push | systemd timer `vio-push-business-central.timer` on a workstation | `local/push_to_business_central.py` | draft invoices in Business Central, `ops.business_central_sync` |
+| Push | task `push_to_business_central` | `src/push_to_business_central.py`, config `src/push_to_business_central.json` | draft invoices in Business Central, `ops.business_central_sync` |
 | Serving | AI/BI dashboard `Vio Travel overview`, Genie space `Vio Travel Genie` | `dashboards/`, `genie/`, metric views in `src/apply_governance.py` | |
 
 The design is ELT. API responses are landed unchanged and every transformation runs inside Databricks, so a parsing
@@ -48,7 +48,7 @@ bug is fixed by replaying the landed files instead of calling the API again.
 | `databricks.yml`, `resources/` | Databricks Asset Bundle: schemas, volume, pipeline, 4 jobs, dashboard, Genie space, SQL alert |
 | `src/` | job tasks; `src/build_bronze_silver_gold/` holds the pipeline source, one file per layer |
 | `dashboards/build_dashboard.py`, `genie/build_genie_space.py` | generators of the dashboard and Genie JSON; edit the script, never the JSON |
-| `local/` | the Business Central push, its config, systemd units, `extend_number_series.py` |
+| `local/` | admin scripts run by a person: `store_business_central_token.py` (renews the Business Central sign-in of the push), `extend_number_series.py` |
 | `sql/` | one-time setup: `setup-catalog.sql` (catalog, grants, `ref` tables), `ref-maps-lab-seed.sql` (lab mappings, never used in production) |
 | `tests/` | unit tests of the API client, the backfill planner, the push logic, SQL shared by the pipeline and the push, every statement of `build_business_central_documents` parsed as Databricks SQL, and its document rules run on a local Spark session |
 | `docs/` | `data-flow.drawio`, `star-schema.drawio` and their PNG exports, screenshots of the workspace and Business Central |
@@ -65,7 +65,7 @@ the medallion layers, plus one schema each for the integration output, reference
 | `bronze` | `tc_<entity>`: one VARIANT row per landed record with file and run metadata, append-only | pipeline (Auto Loader) | pipeline for bookings and accommodations; the permanent archive for snapshot entities |
 | `silver` | current state per entity and `<entity>_history` (SCD (slowly changing dimension) type 2, with validity dates); typed columns | pipeline, plain views from `vio_travel_apply_governance` | `build_business_central_tables`, engineers |
 | `gold` | star schema `dim_*`, `fact_*`, one big table `obt_booking_service`, metric views `*_metrics` | pipeline, `vio_travel_apply_governance` | every workspace user, personal columns masked |
-| `business_central` | `customers`, `vendors`, `sales_invoices`, `sales_lines`, `purchase_invoices`, `purchase_lines`, shaped like Business Central API v2.0; `booking_versions`, `sales_documents`, `purchase_documents`, shaped like the implementation partner specification | `build_business_central_tables`, `build_business_central_documents` | `local/push_to_business_central.py` reads the first six |
+| `business_central` | `customers`, `vendors`, `sales_invoices`, `sales_lines`, `purchase_invoices`, `purchase_lines`, shaped like Business Central API v2.0; `booking_versions`, `sales_documents`, `purchase_documents`, shaped like the implementation partner specification | `build_business_central_tables`, `build_business_central_documents` | `push_to_business_central` reads the first six |
 | `ref` | `umbrella_agency`, `customer_map`, `vendor_map`, `business_central_code_map`: mappings owned by Finance | Finance, through SQL | `build_business_central_tables`, `build_business_central_documents`, pipeline |
 | `governance` | function `mask_pii` | `vio_travel_apply_governance` | column masks |
 | `ops` | `api_calls`, `ingest_runs`, `watermark`, `accommodation_fetch`, `pipeline_event_log`, `build_state`, `dq_results`, `publish`, `business_central_sync` | every task and the push | dashboard page Pipeline operations, SQL alert |
@@ -183,28 +183,28 @@ table `ops.publish` only when every check passes (write-audit-publish). The push
 files are kept 30 days so an older published version stays readable while checks fail. A document that cannot be sent
 gets a value in column `hold_reason`, such as `CUSTOMER_UNMAPPED` or `VENDOR_UNMAPPED`, and waits for a mapping.
 
-`local/push_to_business_central.py` runs on a workstation because the tenant allows only a delegated Azure CLI login,
-not an app registration. Each run:
+Task `push_to_business_central` runs in every job run after `build_business_central_tables` succeeded. Each run:
 
-1. Asks the Jobs API whether `vio_travel_ingest_transform_publish` finished a run since the last push.
-2. Reads the six tables `VERSION AS OF` the last published versions, so it sees one consistent, checked build.
-3. Compares each document's `payload_hash` with its last result in table `ops.business_central_sync` and selects up to
+1. Reads the six tables `VERSION AS OF` the last published versions, so it sees one consistent, checked build.
+2. Compares each document's `payload_hash` with its last result in table `ops.business_central_sync` and selects up to
    100 bookings with changes, oldest first. New documents are taken only when the invoice date or last update falls
-   in the last 30 days (`scope_sql` in `local/config.json`; `--scope_sql` widens it for a backfill); a document sent
+   in the last 30 days (`scope_sql` in `src/push_to_business_central.json`, widened there for a backfill); a document sent
    before whose payload changed is always taken.
-4. Upserts customers and vendors, and loads missing exchange rates through a RapidStart configuration package.
-5. Creates a draft with its lines in one deep-insert POST, or replaces the header and lines of an existing draft in one
+3. Upserts customers and vendors, and loads missing exchange rates through a RapidStart configuration package.
+4. Creates a draft with its lines in one deep-insert POST, or replaces the header and lines of an existing draft in one
    transactional OData `$batch`. A posted document is never changed and is reported with status `NEEDS_CREDIT_MEMO`. A
    cancelled booking or service empties its draft so it cannot be posted. Travel Compositor usually sets the cost of
    a cancelled service to 0, so the tables keep every cancelled service, and a booking left without lines, as a `CANCEL` row; a
    synced document that disappears from the tables is emptied as well, and more than 50 at once
-   (`max_removals_per_run`) stop that step for a person to check. Drafts are never deleted, because deleting a numbered
-   draft makes Business Central create an empty posted invoice.
-6. Writes one result row per document into `ops.business_central_sync` after every booking.
+   (`max_removals_per_run`) stop that step for a person to check, which alert check `e2e_push_removals_over_limit`
+   reports. Drafts are never deleted, because deleting a numbered draft makes Business Central create an empty posted
+   invoice.
+5. Writes one result row per document into `ops.business_central_sync` after every booking, and fails the task when a
+   document or party failed.
 
 POST is retried only on HTTP 429, because a POST that failed with 5xx may have been committed; the next run finds the
 document by its key and updates it instead of creating a duplicate. A document that fails 3 times with the same hash
-waits as a dead letter until its data changes or the push runs with `--retry FAILED`.
+waits as a dead letter until its data changes or the job runs with parameter `push_retry=FAILED`.
 
 A pushed sales invoice in Business Central, one G/L line per service, and the preview of what posting it would write:
 a debit to the receivables account and a credit to the revenue account per line.
@@ -212,6 +212,19 @@ a debit to the receivables account and a credit to the revenue account per line.
 ![Draft sales invoice created by the push](docs/business-central-sales-invoice.png)
 
 ![Preview Posting of the same invoice](docs/business-central-preview-posting.png)
+
+### Sign-in to Business Central
+
+The job runs as the service principal `vio-travel-pipeline`, but the Business Central tenant allows no app
+registration, so the push signs in to Business Central with the delegated login of the trial owner. The refresh token
+of that login is kept in secret scope `vio-business-central`, key `refresh_token`, where the service principal has
+WRITE. Each run trades it for an access token with msal (Azure CLI public client), renews the access token before it
+expires and on HTTP 401, and stores the rotated refresh token back in the secret.
+
+The refresh token stops working after 90 days without a run, a password change or a revoked session. The task then
+fails with a message that names the fix: sign in with `az login --tenant <bc_tenant>` as the Business Central user and
+run `local/store_business_central_token.py` (see [Operations](#operations)), which checks the token against Business
+Central before it stores it.
 
 ### Posted documents per booking version
 
@@ -315,16 +328,17 @@ says why; the values come from Finance or the partner.
 
 | Job or unit | Schedule (Asia/Ho_Chi_Minh) | Tasks | Runs as |
 |---|---|---|---|
-| `vio_travel_ingest_transform_publish` | every hour, at minute 05 | `extract_travel_compositor` → `build_bronze_silver_gold` → `build_business_central_tables` → `build_business_central_documents` → `check_data_quality` (the last two `run_if: ALL_DONE`) | service principal `vio-travel-pipeline` |
+| `vio_travel_ingest_transform_publish` | every hour, at minute 05 | `extract_travel_compositor` → `build_bronze_silver_gold` → `build_business_central_tables` → `push_to_business_central` and `build_business_central_documents` in parallel → `check_data_quality` (`build_business_central_documents` and `check_data_quality` with `run_if: ALL_DONE`) | service principal `vio-travel-pipeline` |
 | `vio_travel_ingest_accommodation_catalog` | Sunday 03:15 | `extract_accommodation_catalog` | service principal |
 | `vio_travel_apply_governance` | Sunday 03:45; run by hand after each deploy | masking function, tags, masks, grants, comments, plain views, metric views, anomaly detection | deploying user, who owns the catalog |
 | `vio_travel_backfill_bookings` | manual | `plan_backfill_windows` → for-each `extract_booking_windows` (one month per iteration, 3 in parallel) | service principal |
-| `vio-push-business-central.timer` (systemd) | every 5 minutes, acts after each finished job run | `push_to_business_central.py --on-new-run` under `flock` | the Business Central user |
-| SQL alert `pipeline_freshness` | hourly, at minute 25, while the warehouse is still up after the push | dead-man switch on `ops.dq_results` | deploying user |
+| SQL alert `pipeline_freshness` | hourly, at minute 25 | dead-man switch on `ops.dq_results` | deploying user |
 
 Task `extract_travel_compositor` retries twice, 5 minutes apart. The pipeline retries a failed update once by itself
 (pipeline setting `pipelines.numUpdateRetryAttempts`), so its task has no retry. `build_business_central_tables` retries
-once. `build_business_central_documents` does not retry: a rerun reads the same bookings and gives the same result. The job times out after 45 minutes, and a run that starts while another is active waits in the queue.
+once. `build_business_central_documents` does not retry: a rerun reads the same bookings and gives the same result.
+`push_to_business_central` does not retry: a POST that failed may have been committed, and the next hourly run finds
+the document by its key. The job times out after 45 minutes, and a run that starts while another is active waits in the queue.
 
 The backfill job only lands files and never moves the watermark; the next scheduled run loads them. So the two jobs
 never update the pipeline or rebuild `business_central` at the same time, and a failed month is re-read with Repair
@@ -341,7 +355,7 @@ run.
 | `build_business_central_documents`, severity `block` | versions numbered 1 to n, unique IntegrationKey, invoice numbers of 8 digits and unique, emitted invoice numbers unchanged, documents adding up to the booking total and the service cost, deposit and balance adding up to the invoice | the task fails after writing its results and keeps its watermark, so the next run reads the same bookings again |
 | `build_business_central_documents`, severity `warn` | documents held or with an unmapped item, invoices without destinations or start date, cancellations without a cancellation date, cancelled services that keep a cost, payment split that differs from the total, amendment costs in another currency | recorded and shown on the dashboard |
 | `build_business_central_tables` and `check_data_quality`, severity `warn` | held documents, totals that differ from lines, unknown service arrays, unknown suppliers, overdue payments, sales waiting for the push | recorded and shown on the dashboard |
-| `check_data_quality`, severity `alert` (`gold_`, `e2e_`) | gold key uniqueness, fact grain, orphan facts, totals against silver; extract failing or stale per entity, no booking updated in Travel Compositor for 48 hours, pipeline failed or stale, `business_central` behind silver, push stalled | the task fails and the failure e-mail goes out |
+| `check_data_quality`, severity `alert` (`gold_`, `e2e_`) | gold key uniqueness, fact grain, orphan facts, totals against silver; extract failing or stale per entity, no booking updated in Travel Compositor for 48 hours, pipeline failed or stale, `business_central` behind silver, push stalled, push dead letters, more synced documents unpublished than `max_removals_per_run` | the task fails and the failure e-mail goes out |
 | anomaly detection on `silver`, `gold`, `business_central` | freshness and completeness of every table, learned from its history | Unity Catalog health indicator and the system table `system.data_quality_monitoring.table_results` |
 
 Every check writes one row per run into table `ops.dq_results` with the number of failing rows and up to 5 sample
@@ -354,16 +368,15 @@ keys. Check names follow the convention in [Conventions](#conventions).
 | Travel Compositor to silver | 1 hour plus run time | `e2e_extract_failing_or_stale`, `e2e_pipeline_failed_or_stale` |
 | silver to gold, dashboard, Genie | same pipeline update | expectations, `gold_` checks |
 | silver to `business_central` | same job run | `e2e_business_central_behind_silver` |
-| `business_central` to Business Central | 5 minutes after the run, 100 bookings per push | `e2e_push_stalled`, `e2e_sales_waiting_for_push`, `e2e_push_dead_letters` |
-| the job itself | | the push timer, from the Jobs API every 5 minutes: no run started for 150 minutes, or the last 3 runs failed; SQL alert `pipeline_freshness`: no `e2e_` row for 150 minutes |
+| `business_central` to Business Central | same job run, 100 bookings per run | `e2e_push_stalled`, `e2e_sales_waiting_for_push`, `e2e_push_dead_letters`, `e2e_push_removals_over_limit` |
+| the job itself | | SQL alert `pipeline_freshness`: no `e2e_` row for 150 minutes |
 
 Notifications fire when a problem starts, not on every run. Task `check_data_quality` fails, and the job e-mails,
 when an alert check starts failing, and again once a day at the 08:00 run while it lasts; the results of every run
 stay in `ops.dq_results`. The job also e-mails on runs longer than 30 minutes (`health` rule), and the pipeline on
-update and flow failure. The push timer needs no Databricks compute for its job check, so it still reports when the
-daily quota stops every job and warehouse; it raises one desktop notification when a problem starts and one when it
-clears, and the push unit raises one when a run fails. A push that finds the SQL warehouse unavailable exits with code
-75 and is retried on the next tick, and a tripped removal guard notifies once. The dashboard page Pipeline operations
+update and flow failure. A failed push fails its task, so the run e-mails; a tripped removal guard does not fail the
+push and is reported by `e2e_push_removals_over_limit`. When the daily quota stops every job and warehouse, nothing in
+the workspace runs, so neither the job nor the SQL alert can report it. The dashboard page Pipeline operations
 shows run times, API calls, check results and the push backlog from `ops`.
 
 ## Performance and cost
@@ -375,9 +388,10 @@ shows run times, API calls, check results and the push backlog from `ops`.
 - Silver streaming tables have change data feed and row tracking; bronze has deletion vectors and row tracking.
 - Serverless compute everywhere. The pipeline is triggered, not continuous, because Free Edition has a daily compute
   quota. With a run every 30 minutes the quota ran out at about 14:00 each day and no job, pipeline or warehouse
-  started until it reset, so the job runs hourly. A scheduled run takes about 7 minutes. The Starter Warehouse stops
-  10 minutes after its last query and Free Edition does not allow changing that, so the alert runs inside the
-  window the push already opened. The system table `system.billing.usage` shows the cost per product,
+  started until it reset, so the job runs hourly. A scheduled run takes about 7 minutes, without the push. The push
+  runs on serverless job compute inside the run and adds its time to the quota; a run with nothing to send reads the
+  sync state and stops. No task uses the Starter Warehouse; it starts for the dashboard, Genie and the SQL alert, and
+  stops 10 minutes after its last query (Free Edition does not allow changing that). The system table `system.billing.usage` shows the cost per product,
   including anomaly detection, which has the value `DATA_QUALITY_MONITORING` in column `billing_origin_product`.
 - Free Edition allows one active pipeline and 5 concurrent tasks, and the metastore stopped at 500 tables with the
   error state `UC_RESOURCE_QUOTA_EXCEEDED`. Each pipeline table counts twice because of its hidden
@@ -390,8 +404,8 @@ shows run times, API calls, check results and the push backlog from `ops`.
 
 | Control | Implementation |
 |---|---|
-| Identity | jobs and the pipeline run as the service principal `vio-travel-pipeline`; only `vio_travel_apply_governance` and the push run as a person |
-| Secrets | Travel Compositor credentials in the secret scope `vio-tc`, readable only by the service principal and the owner; no credential in the repo |
+| Identity | jobs and the pipeline run as the service principal `vio-travel-pipeline`; only `vio_travel_apply_governance` runs as a person; the push signs in to Business Central as the trial owner with a delegated refresh token |
+| Secrets | Travel Compositor credentials in the secret scope `vio-tc`, readable only by the service principal and the owner; the Business Central refresh token in the secret scope `vio-business-central`, where the service principal has WRITE to store the rotated token; no credential in the repo |
 | Personal data | column tag `pii` (`email`, `phone`, `name`, `address`) and table tag `contains_pii`; column masks with `governance.mask_pii` on the typed personal columns of silver and `gold.dim_user` show values only to the group `vio_pii_readers`. The silver column `payload` keeps the raw record unmasked and `business_central` must hold real e-mails and addresses for the push, so both are protected by grants only |
 | Access | every workspace user (`account users`) reads `gold`, masked; only the service principal and the catalog owner read `bronze`, `silver` and `business_central` |
 | Documentation | comments on every silver and gold column (pipeline schemas) and on every table, including `ops`, `ref` and `business_central`; Catalog Explorer and Genie read them |
@@ -412,18 +426,19 @@ are on.
 | Task keys | `<verb>_<object>`, with the source file or folder named like the task | task `build_bronze_silver_gold`, folder `src/build_bronze_silver_gold/` |
 | Check names | `<layer>_<what is wrong>`; a bronze expectation adds the table | `gold_fact_orphans`, `bronze_record_parsed.tc_bookings` |
 | Tags | jobs and the pipeline: `project: vio_travel`, `data_classification` (`personal_data`, `internal`, `public`); Unity Catalog: `contains_pii`, `pii` | |
-| Python | ruff lint and format, line length 120, standard library plus `requests` and `databricks-sdk`; tests also use `sqlglot` | |
+| Python | ruff lint and format, line length 120, standard library plus `requests`, `databricks-sdk` and `msal`; tests also use `sqlglot` and `pyspark` | |
 | Commits | imperative English subject, one concern per commit | `Retry the rate source on timeouts and 5xx` |
 | Branches | `main` is deployed; work happens on `<user>-dev/<topic>` and is merged | `<user>-dev/push-scope` |
 
 ## Development
 
 Development needs Python 3.11 or later, [uv](https://docs.astral.sh/uv/), Java 17 or later for the local Spark tests,
-the Databricks CLI (CI uses v1.26.0) logged in to the workspace, and the Azure CLI for the push.
+the Databricks CLI (CI uses v1.26.0) logged in to the workspace, and the Azure CLI to renew the Business Central
+sign-in and to run `local/extend_number_series.py`.
 
 ```bash
 uvx ruff check . && uvx ruff format --check .
-uv run --no-project --with pytest --with requests --with databricks-sdk --with sqlglot --with pyspark==4.0.1 pytest -q tests
+uv run --no-project --with pytest --with requests --with databricks-sdk --with sqlglot --with pyspark==4.0.1 --with msal pytest -q tests
 git config core.hooksPath .githooks        # run the same checks before every git push
 databricks bundle validate -t prod
 ```
@@ -459,20 +474,20 @@ databricks bundle run vio_travel_ingest_transform_publish -t prod --params rebui
 # regenerate the dashboard or Genie space after editing their scripts
 python3 dashboards/build_dashboard.py && python3 genie/build_genie_space.py && databricks bundle deploy -t prod
 
-# Business Central push (needs `az login` as a Business Central user)
-cd local
-uv run --no-project --with databricks-sdk --with requests push_to_business_central.py --dry-run
-cp systemd/*.service systemd/*.timer ~/.config/systemd/user/ && systemctl --user daemon-reload
-systemctl --user enable --now vio-push-business-central.timer
-uv run --no-project --with databricks-sdk --with requests push_to_business_central.py --retry SKIPPED,FAILED
+# send dead-lettered documents again after fixing the cause
+databricks bundle run vio_travel_ingest_transform_publish -t prod --params push_retry=SKIPPED,FAILED
 
-# extend a Business Central number series that ran out (documents take their number by posting date)
-uv run --no-project --with databricks-sdk --with requests extend_number_series.py \
+# renew the Business Central sign-in of the push after the task reports a refused refresh token
+az login --tenant <bc_tenant>
+uv run --no-project --with msal --with requests --with databricks-sdk local/store_business_central_token.py
+
+# extend a Business Central number series that ran out (documents take their number by posting date; needs az login)
+uv run --no-project --with requests local/extend_number_series.py \
   --series P-INV+ --line_no 20000 --starting_no 110000 --ending_no 199999 --starting_date 2015-01-01
 ```
 
-`local/config.json` holds the target company, G/L accounts, posting groups, the push scope and limits. It contains
-IDs only, no credential.
+`src/push_to_business_central.json` holds the target company, G/L accounts, posting groups, the push scope and
+limits. It contains IDs only, no credential.
 
 ## Limitations
 
@@ -493,4 +508,5 @@ IDs only, no credential.
 - `payment.amount` plus `payment.deferredAmount` differs from the booking total on some bookings, so the deposit line
   takes `payment.amount` and the balance line the rest. Paid Amount stays NULL: the live bookings show payment systems
   DEPOSIT and REPAYD only, and Vio has not said which marks Trust My Travel.
-- The push depends on a workstation and a delegated login; production needs an app registration and a job.
+- The push signs in with the delegated login of one person, renewed by hand when its refresh token expires;
+  production needs an app registration.

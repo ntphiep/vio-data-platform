@@ -582,9 +582,9 @@ PAGES = [
                 [
                     "## Pipeline operations\n",
                     "Source: ops.ingest_runs, ops.pipeline_event_log, ops.dq_results, ops.publish, ops.business_central_sync, "
-                    "business_central.*. Job vio_travel_ingest_transform_publish runs every 30 minutes, at minute 05 and 35, and "
-                    "triggers the pipeline vio_travel_build_bronze_silver_gold; local/push_to_business_central.py pushes within 5 minutes after "
-                    "each finished run.\n",
+                    "business_central.*. Job vio_travel_ingest_transform_publish runs every hour at minute 05 and triggers the "
+                    "pipeline vio_travel_build_bronze_silver_gold; its task push_to_business_central pushes the published "
+                    "business_central tables into Business Central.\n",
                 ],
                 (0, 0, 6, 2),
             ),

@@ -1,7 +1,10 @@
-"""Push the published business_central tables from Databricks into Business Central (runs on this machine).
+"""Task push_to_business_central - push the published business_central tables of catalog <catalog> into Business Central.
 
-Why local: the Business Central token is a delegated Azure CLI login (`az login` as the trial owner).
-A Databricks job cannot do an interactive login, and an app registration needs a tenant admin.
+Sign-in: the tenant of the Business Central trial allows no app registration, so the task signs in with the delegated
+login of the trial owner. Secret scope vio-business-central, key refresh_token, holds the refresh token of that login
+(Azure CLI public client); local/store_business_central_token.py stores it after `az login`. The task trades it for an
+access token with msal, renews the access token before it expires and on HTTP 401, and stores the rotated refresh
+token back in the secret. The job runs as a service principal with WRITE on the scope.
 
 Flow per run
 1. Read the last row of <catalog>.ops.publish and read every business_central table AS OF those versions, so
@@ -11,7 +14,7 @@ Flow per run
    payload_hash differs from the hash of its latest attempt, or the latest attempt failed. Terminal results
    (TERMINAL) are not retried while the hash is unchanged. Transient results (TRANSIENT) are retried until
    MAX_FAILURES with the same hash, then the document waits as a dead letter until the data changes.
-   Up to --limit bookings with something to send are pushed, oldest change first.
+   Up to max_bookings_per_run bookings with something to send are pushed, oldest change first.
 3. Held documents (hold_reason, or a purchase invoice whose sales invoice is held) are recorded as HELD and never
    sent; a HELD row is written again only when the hash or the reason changes.
 4. Upsert customers and vendors whose latest synced hash differs, and complete posting groups through the
@@ -24,29 +27,21 @@ Flow per run
    lines of its draft so it cannot be posted (CANCELLED_DRAFT_EMPTIED).
 7. A document synced before that is no longer in the published tables (booking left BOOKED/RQ/CANCELED, active
    service cost dropped to 0, key changed) has its draft emptied (REMOVED_DRAFT_EMPTIED); a posted one is only recorded
-   (REMOVED_POSTED). More than max_removals_per_run such documents stop the removal step for a human check.
+   (REMOVED_POSTED). More than max_removals_per_run such documents stop the removal step for a human check; alert
+   check e2e_push_removals_over_limit of check_data_quality reports it.
 8. Write the result rows into ops.business_central_sync after every booking, so a crash loses at most one booking's rows; a
    document created but not recorded is found again by its key on the next run and updated, not duplicated.
 
-Timer mode (--on-new-run, used by the systemd timer every 5 minutes): the run asks the Jobs API, which needs no
-SQL warehouse, whether job vio_travel_ingest_transform_publish finished a run since the last push, and exits at once when it did
-not and the last push left nothing behind. The same Jobs API answer feeds a dead-man check that works when the daily
-compute quota is used up: no run started for JOB_STALE_MINUTES, or the last JOB_FAILED_RUNS runs failed, raises one
-desktop notification when the state starts, and one when it clears. When the SQL warehouse is unavailable (quota
-used up, warehouse cannot start) the run exits with code 75, which the unit treats as skipped, and the next tick tries
-again. State lives in .push_state.json next to this file.
-
-Usage: uv run --no-project --with databricks-sdk --with requests push_to_business_central.py [--limit N] [--dry-run] [--on-new-run]
-Config: config.json next to this file. The systemd unit wraps the run in flock, so two runs never overlap.
+The task fails when a document or party failed, so the job sends its failure e-mail.
+Config: push_to_business_central.json next to this file (company, G/L accounts, posting groups, scope, limits).
 """
 
 import argparse
+import base64
 import datetime as dt
 import email.utils
 import gzip
 import json
-import subprocess
-import sys
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -89,84 +84,17 @@ TOTAL = "totalAmountIncludingTax"  # field of salesInvoices and purchaseInvoices
 MAX_BATCH = 100
 
 
-STATE = Path(__file__).parent / ".push_state.json"
-# Exit code that the systemd unit treats as skipped, not failed (SuccessExitStatus=75).
-EXIT_SKIPPED = 75
-# Dead-man check on the job in timer mode: the job runs hourly at minute 05.
-JOB_STALE_MINUTES = 150
-JOB_FAILED_RUNS = 3
-# Messages of the SQL Statement API when the warehouse cannot run anything (Free Edition daily quota).
-WAREHOUSE_UNAVAILABLE = (
-    "could not be processed by the warehouse",
-    "free daily limit",
-    "Cannot start warehouse",
-)
-
-
-GUARD_TITLE = "Vio push into Business Central: removal step skipped"
-
-
-class WarehouseUnavailable(RuntimeError):
-    """The SQL warehouse cannot run statements now; the push is skipped and retried on the next tick."""
-
-
-def notify(title, body):
-    """Desktop notification; printed as well, so the journal keeps it."""
-    print(f"{title}: {body}")
-    try:
-        # A problem stays on screen until dismissed; the all-clear is transient.
-        urgency = ["-u", "normal", "-e"] if body == "back to normal" else ["-u", "critical"]
-        subprocess.run(["notify-send", *urgency, "-a", "vio-push-business-central", title, body], check=False)
-    except OSError:
-        pass
-
-
-def notify_on_change(state, key, problem, title):
-    """Notify when `problem` (a string, or None when fine) differs from the one stored under `key` in state, so a
-    lasting problem raises one notification instead of one per timer tick."""
-    if problem != state.get(key):
-        notify(title, problem or "back to normal")
-    state[key] = problem
-
-
-def save_state(state):
-    STATE.write_text(json.dumps(state))
+CONFIG = "push_to_business_central.json"
+# Delegated sign-in: refresh token of the Azure CLI public client, stored by local/store_business_central_token.py.
+SECRET_SCOPE, SECRET_KEY = "vio-business-central", "refresh_token"
+AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+BC_SCOPE = ["https://api.businesscentral.dynamics.com/.default"]
+# An access token lives 60 to 90 minutes; it is renewed this many seconds before it expires.
+RENEW_BEFORE_SECONDS = 300
 
 
 def load_cfg(path=None):
-    return json.loads(Path(path or Path(__file__).parent / "config.json").read_text())
-
-
-def job_problem(runs, now_ms):
-    """Dead-man check on the job from its latest runs (newest first, any state): a text, or None when healthy."""
-    if not runs:
-        return "the job has no run"
-    started = runs[0].start_time or 0
-    if (now_ms - started) / 60000 > JOB_STALE_MINUTES:
-        # The text names the last start, not the age, so it stays the same until a new run starts and
-        # notify_on_change raises it once instead of on every tick.
-        since = dt.datetime.fromtimestamp(started / 1000).strftime("%d/%m %H:%M")
-        return f"no run of the job started since {since} (daily quota used up, schedule paused or deploy broken)"
-    done = [r for r in runs if r.state and r.state.result_state is not None]
-    if len(done) >= JOB_FAILED_RUNS and all(r.state.result_state.value != "SUCCESS" for r in done[:JOB_FAILED_RUNS]):
-        return f"the last {JOB_FAILED_RUNS} runs of the job failed: {(done[0].state.state_message or '')[:200]}"
-    return None
-
-
-def job_run_to_push(cfg, state):
-    """Timer mode: the latest finished run of the job when there is something new to push, else None. Runs the
-    dead-man check on the same Jobs API answer."""
-    from databricks.sdk import WorkspaceClient
-
-    runs = list(WorkspaceClient().jobs.list_runs(job_id=cfg["job_id"], limit=JOB_FAILED_RUNS + 2))
-    notify_on_change(
-        state, "job_problem", job_problem(runs, time.time() * 1000), "Vio job vio_travel_ingest_transform_publish"
-    )
-    finished = [r for r in runs if r.state and r.state.result_state is not None]
-    latest = finished[0].run_id if finished else None
-    if latest is not None and (latest != state.get("last_job_run") or state.get("backlog")):
-        return latest
-    return None
+    return json.loads(Path(path or Path(__file__).with_name(CONFIG)).read_text())
 
 
 def lit(v):
@@ -226,52 +154,93 @@ def fx_get(url, params, attempts=4, sleep=time.sleep):
 
 
 # ------------------------------------------------------------------ Databricks SQL
-class DBX:
-    def __init__(self, cfg):
-        from databricks.sdk import WorkspaceClient
+class SparkSQL:
+    """Runs SQL on the Spark session of the task. q(sql) returns rows as dicts whose values are strings or None,
+    the shape the SQL Statement Execution API returned when the push ran outside Databricks, so the callers parse
+    numbers with Decimal and booleans with truthy. Booleans come back as 'true' / 'false', DATE as YYYY-MM-DD,
+    TIMESTAMP as yyyy-MM-dd HH:mm:ss[.SSSSSS] in the session time zone, arrays, maps and structs as JSON."""
 
-        self.w, self.cfg = WorkspaceClient(), cfg
-        self.c = cfg["catalog"]
+    def __init__(self, spark):
+        self.spark = spark
 
-    def q(self, sql, deadline_s=600):
-        from databricks.sdk.service.sql import StatementState
+    def q(self, sql):
+        from pyspark.sql import functions as F
+        from pyspark.sql.types import ArrayType, MapType, StructType
 
-        ex = self.w.statement_execution
-        try:
-            r = ex.execute_statement(statement=sql, warehouse_id=self.cfg["warehouse_id"], wait_timeout="50s")
-        except Exception as e:  # noqa: BLE001 - the SDK raises BadRequest for an unavailable warehouse
-            if any(m in str(e) for m in WAREHOUSE_UNAVAILABLE):
-                raise WarehouseUnavailable(str(e)[:300]) from e
-            raise
-        t_end = time.time() + deadline_s
-        while r.status.state in (StatementState.PENDING, StatementState.RUNNING):
-            if time.time() > t_end:
-                ex.cancel_execution(r.statement_id)
-                raise RuntimeError(f"SQL timed out after {deadline_s}s")
-            time.sleep(3)
-            r = ex.get_statement(r.statement_id)
-        if r.status.state != StatementState.SUCCEEDED:
-            message = r.status.error.message if r.status.error else ""
-            if any(m in (message or "") for m in WAREHOUSE_UNAVAILABLE):
-                raise WarehouseUnavailable(message[:300])
-            raise RuntimeError(f"SQL failed: {r.status.error.message if r.status.error else r.status.state}")
-        cols = [col.name for col in r.manifest.schema.columns] if r.manifest and r.manifest.schema else []
-        rows, res = [], r.result
-        while res is not None:  # follow every result chunk
-            rows.extend(res.data_array or [])
-            nxt = res.next_chunk_index
-            res = ex.get_statement_result_chunk_n(r.statement_id, nxt) if nxt is not None else None
-        return [dict(zip(cols, row, strict=True)) for row in rows]
+        df = self.spark.sql(sql)
+        names = df.columns
+        if not names:
+            return []
+        # positional names: a SELECT may return two columns with the same name
+        df = df.toDF(*[f"c{n}" for n in range(len(names))])
+        cols = [
+            F.to_json(F.col(f.name)) if isinstance(f.dataType, ArrayType | MapType | StructType) else F.col(f.name)
+            for f in df.schema.fields
+        ]
+        rows = df.select([c.cast("string").alias(f"c{n}") for n, c in enumerate(cols)]).collect()
+        return [dict(zip(names, row, strict=True)) for row in rows]
+
+
+# ------------------------------------------------------------------ Business Central sign-in
+class RefreshTokenAuth:
+    """Business Central access tokens from the refresh token in secret scope vio-business-central.
+
+    token() returns the current access token and renews it RENEW_BEFORE_SECONDS before it expires; token(force=True)
+    renews it at once (after HTTP 401). Every renewal stores the refresh token Microsoft Entra ID returns, which
+    replaces the one used, back in the secret. No token is ever printed.
+    secrets: the SecretsAPI of a WorkspaceClient (get_secret returns the value base64-encoded); app: an msal
+    PublicClientApplication. Both are parameters so tests can pass fakes."""
+
+    def __init__(self, tenant, secrets=None, app=None, clock=time.time):
+        if secrets is None:
+            from databricks.sdk import WorkspaceClient
+
+            secrets = WorkspaceClient().secrets
+        if app is None:
+            import msal
+
+            app = msal.PublicClientApplication(
+                AZURE_CLI_CLIENT_ID, authority=f"https://login.microsoftonline.com/{tenant}"
+            )
+        self.secrets, self.app, self.clock = secrets, app, clock
+        self.refresh_token, self.access_token, self.expires_at = None, None, 0.0
+
+    def token(self, force=False):
+        if force or self.access_token is None or self.clock() >= self.expires_at - RENEW_BEFORE_SECONDS:
+            self._renew()
+        return self.access_token
+
+    def _renew(self):
+        if self.refresh_token is None:
+            secret = self.secrets.get_secret(scope=SECRET_SCOPE, key=SECRET_KEY)
+            self.refresh_token = base64.b64decode(secret.value).decode()
+        res = self.app.acquire_token_by_refresh_token(self.refresh_token, scopes=BC_SCOPE)
+        if "access_token" not in res:
+            reason = (res.get("error_description") or "").splitlines()[0][:200] if res.get("error_description") else ""
+            raise RuntimeError(
+                f"Microsoft Entra ID refused the refresh token in secret {SECRET_SCOPE}/{SECRET_KEY} "
+                f"({res.get('error')}: {reason}). Run `az login --tenant <bc_tenant>` as the Business Central user, "
+                "then local/store_business_central_token.py"
+            )
+        rotated = res.get("refresh_token")
+        if rotated and rotated != self.refresh_token:
+            self.secrets.put_secret(scope=SECRET_SCOPE, key=SECRET_KEY, string_value=rotated)
+            self.refresh_token = rotated
+        self.access_token = res["access_token"]
+        self.expires_at = self.clock() + float(res.get("expires_in") or 3600)
 
 
 # ------------------------------------------------------------------ Business Central
 class BC:
-    def __init__(self, cfg, session=None, sleep=time.sleep):
+    """Business Central API client. token(force=False) returns an access token (RefreshTokenAuth.token by default);
+    it is asked before every request, so a long run renews the token before it expires."""
+
+    def __init__(self, cfg, token=None, session=None, sleep=time.sleep):
         self.cfg, self.sleep = cfg, sleep
+        self.token = token or RefreshTokenAuth(cfg["bc_tenant"]).token
         self.root = f"https://api.businesscentral.dynamics.com/v2.0/{cfg['bc_environment']}"
         self.s = session or requests.Session()
         self.s.headers.update({"Content-Type": "application/json"})
-        self._token()
         comps = self.ok(self.call("GET", f"{self.root}/api/v2.0/companies"), "GET companies")["value"]
         cid = next(x["id"] for x in comps if x["name"] == cfg["bc_company"])
         self.company_id = cid
@@ -279,35 +248,15 @@ class BC:
         self.odata = f"{self.root}/ODataV4/Company('{cfg['bc_company']}')"
         self.currencies = None
 
-    def _token(self):
-        out = subprocess.run(
-            [
-                "az",
-                "account",
-                "get-access-token",
-                "--resource",
-                "https://api.businesscentral.dynamics.com",
-                "--tenant",
-                self.cfg["bc_tenant"],
-                "--query",
-                "accessToken",
-                "-o",
-                "tsv",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if out.returncode != 0:
-            raise RuntimeError("Azure CLI has no valid login for the Business Central tenant; run `az login`")
-        self.s.headers["Authorization"] = f"Bearer {out.stdout.strip()}"
-
     def call(self, method, url, **kw):
         """Retries 429 for every method. 5xx and network errors are retried only for GET, PATCH and DELETE:
         a POST that timed out may have been committed, so it is not repeated; the next run finds the record
         by its key instead of creating a second one."""
         idempotent = method != "POST"
-        renewed = False
+        renewed = renew = False
         for attempt in range(1, 7):
+            self.s.headers["Authorization"] = f"Bearer {self.token(force=renew)}"
+            renew = False
             try:
                 r = self.s.request(method, url, timeout=(10, 120), **kw)
             except requests.RequestException:
@@ -316,8 +265,7 @@ class BC:
                     continue
                 raise
             if r.status_code == 401 and not renewed:
-                self._token()
-                renewed = True
+                renewed = renew = True
                 continue
             if r.status_code == 429 or (idempotent and r.status_code in (500, 502, 503, 504)):
                 if attempt < 6:
@@ -772,60 +720,46 @@ def doc_queries(c, company, g, scope):
 
 
 def main():
+    from pyspark.sql import SparkSession
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--limit", type=int)
-    ap.add_argument("--scope_sql", help="override the SQL filter on sales invoices, e.g. for a backfill push")
-    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--catalog", default="vio_travel")
+    ap.add_argument("--run_id", default="")
+    ap.add_argument("--config", help=f"path of {CONFIG}; default: next to this file")
     ap.add_argument(
         "--retry",
         default="",
         help="comma-separated results to send again although the payload did not change, e.g. NO_EXCHANGE_RATE,FAILED",
     )
-    ap.add_argument("--on-new-run", action="store_true", help="exit unless the job finished a run since the last push")
     a = ap.parse_args()
-    cfg = load_cfg()
-    state = json.loads(STATE.read_text()) if STATE.exists() else {}
-    try:
-        run(a, cfg, state)
-    except WarehouseUnavailable as e:
-        print(f"SQL warehouse unavailable, push skipped until the next tick: {e}")
-        sys.exit(EXIT_SKIPPED)
-    finally:
-        save_state(state)
+    cfg = {**load_cfg(a.config), "catalog": a.catalog}
+    retry = frozenset(x.strip() for x in a.retry.split(",") if x.strip())
+    failed = run(cfg, SparkSQL(SparkSession.builder.getOrCreate()), a.run_id, retry)
+    if failed:
+        # fails the task, so the job sends its failure e-mail
+        raise RuntimeError(f"{failed} documents or parties failed; see result FAILED in ops.business_central_sync")
 
 
-def run(a, cfg, state):
-    """One push. Updates state in place; main() saves it. Exits 1 when a document or party failed."""
-    limit = a.limit or cfg.get("max_bookings_per_run", 100)
-    job_run = None
-    if a.on_new_run:
-        job_run = job_run_to_push(cfg, state)
-        if job_run is None:
-            print("no new job run and no backlog, nothing to do")
-            return
-    db = DBX(cfg)
+def run(cfg, db, run_id="", retry=frozenset(), bc=None):
+    """One push. Returns the number of FAILED results."""
+    limit = cfg.get("max_bookings_per_run", 100)
     c = cfg["catalog"]
     pub = db.q(f"SELECT run_id, versions FROM {c}.ops.publish ORDER BY published_at DESC LIMIT 1")
     if not pub:
         print("no published business_central build yet")
-        return
+        return 0
     ver = json.loads(pub[0]["versions"])
     g = {t: f"{c}.business_central.{t} VERSION AS OF {v}" for t, v in ver.items()}
-    print(f"reading business_central published by run {pub[0]['run_id']}: {ver}")
+    print(f"job run {run_id}: reading business_central published by run {pub[0]['run_id']}: {ver}")
     db.q(f"""CREATE TABLE IF NOT EXISTS {c}.ops.business_central_sync (synced_at TIMESTAMP, doc_type STRING, doc_key STRING,
              payload_hash STRING, bc_company STRING, bc_id STRING, bc_number STRING, result STRING, error STRING)""")
     company = lit(cfg["bc_company"])
-    scope = a.scope_sql or cfg.get("scope_sql", "TRUE")
-    q = doc_queries(c, company, g, scope)
-    retry = frozenset(x.strip() for x in a.retry.split(",") if x.strip())
+    q = doc_queries(c, company, g, cfg.get("scope_sql", "TRUE"))
     todo, held, pending = plan(db.q(q["sales"]), db.q(q["purchases"]), limit, retry)
     removed = db.q(q["removed"])
     if not todo and not held and not removed:
         print("nothing to push")
-        notify_on_change(state, "removal_guard", None, GUARD_TITLE)
-        if job_run is not None:
-            state.update(last_job_run=job_run, backlog=False)
-        return
+        return 0
     p_heads = [p for h in todo for p in h["_purchases"]]
 
     def party_synced(kind):
@@ -851,14 +785,7 @@ def run(a, cfg, state):
         f"purchase docs, {len(held)} held to record, {len(removed)} no longer published, "
         f"{len(custs)} customers and {len(vends)} vendors to upsert"
     )
-    if a.dry_run:
-        for h in todo:
-            print(json.dumps({k: v for k, v in h.items() if k != "_purchases"}, ensure_ascii=False))
-        for r in removed:
-            print("no longer published:", json.dumps(r, ensure_ascii=False))
-        return
-
-    bc = BC(cfg)
+    bc = bc or BC(cfg)
     lcy = cfg["bc_local_currency"]
     results, failed_total = [], 0
 
@@ -866,7 +793,7 @@ def run(a, cfg, state):
         nonlocal failed_total
         failed_total += result == "FAILED"
         # microseconds keep rows of one key in order for max_by(..., synced_at)
-        now = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")
+        now = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         results.append(
             f"(TIMESTAMP'{now}', {lit(doc_type)}, {lit(key)}, {lit(phash)}, {company}, "
             f"{lit((rec or {}).get('id'))}, {lit((rec or {}).get('number'))}, {lit(result)}, {lit(error)})"
@@ -909,17 +836,9 @@ def run(a, cfg, state):
         for doc_type, key, phash, reason in held:
             record(doc_type, key, phash, None, "HELD", reason)
         flush()
-        # A tripped guard needs a person, not a retry: it notifies once when it starts and once when it clears,
-        # instead of failing the unit on every tick.
-        guard_ok = process_removals(bc, removed, cfg.get("max_removals_per_run", 50), record)
-        notify_on_change(
-            state,
-            "removal_guard",
-            None
-            if guard_ok
-            else "more synced documents than max_removals_per_run are no longer published; check the build",
-            GUARD_TITLE,
-        )
+        # A tripped guard needs a person, not a retry: the task does not fail for it; alert check
+        # e2e_push_removals_over_limit of check_data_quality reports it once, and again at the 08:00 run.
+        process_removals(bc, removed, cfg.get("max_removals_per_run", 50), record)
         flush()
 
         def send(doc_type, key, phash, party, cur, day, fn):
@@ -1005,11 +924,8 @@ def run(a, cfg, state):
             flush()
     finally:
         flush()
-        if job_run is not None:
-            # more bookings waiting than this run took: the next timer tick continues without a new job run
-            state.update(last_job_run=job_run, backlog=pending > len(todo))
     print(f"done: results written to {c}.ops.business_central_sync, {failed_total} failed")
-    sys.exit(1 if failed_total else 0)
+    return failed_total
 
 
 if __name__ == "__main__":

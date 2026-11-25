@@ -18,15 +18,19 @@ import datetime as dt
 import json
 from zoneinfo import ZoneInfo
 
-# same result groups as local/push_to_business_central.py: a document is done when its latest attempt is terminal for its hash
+# same result groups as task push_to_business_central: a document is done when its latest attempt is terminal for its hash
 TERMINAL = (
     "('CREATED', 'UPDATED', 'RECREATED', 'CANCELLED_DRAFT_EMPTIED', 'NEEDS_CREDIT_MEMO', 'NOTHING_TO_CANCEL', "
     "'NO_EXCHANGE_RATE', 'REMOVED_DRAFT_EMPTIED', 'REMOVED_POSTED', 'REMOVED_NOT_FOUND')"
 )
 ATTEMPT = TERMINAL[:-1] + ", 'FAILED')"
 MAX_FAILURES = 3
-# Results after which a document may exist in Business Central; same as EVER_SENT in local/push_to_business_central.py.
+# Results after which a document may exist in Business Central; same as EVER_SENT in src/push_to_business_central.py.
 EVER_SENT = "('CREATED', 'UPDATED', 'RECREATED', 'CANCELLED_DRAFT_EMPTIED', 'FAILED', 'NEEDS_CREDIT_MEMO')"
+# Results after which nothing is left to empty when a document leaves the published tables; same as CLOSED there.
+CLOSED = (
+    "('CANCELLED_DRAFT_EMPTIED', 'NOTHING_TO_CANCEL', 'REMOVED_DRAFT_EMPTIED', 'REMOVED_POSTED', 'REMOVED_NOT_FOUND')"
+)
 # Lasting alerts fail the task again once a day, at the run of this hour.
 TIMEZONE = "Asia/Ho_Chi_Minh"
 REMINDER_HOUR = 8
@@ -55,8 +59,16 @@ def main():
     ap.add_argument("--run_id", default="")
     ap.add_argument("--bc_company", default="My Company")
     ap.add_argument("--pipeline_stale_minutes", type=int, default=150, help="the job runs every hour")
-    ap.add_argument("--push_stale_minutes", type=int, default=180, help="the push follows each hourly run")
-    ap.add_argument("--push_scope_days", type=int, default=30, help="same as scope_sql in local/config.json")
+    ap.add_argument("--push_stale_minutes", type=int, default=180, help="the push runs in each hourly run")
+    ap.add_argument(
+        "--push_scope_days", type=int, default=30, help="same as scope_sql in push_to_business_central.json"
+    )
+    ap.add_argument(
+        "--max_removals_per_run",
+        type=int,
+        default=50,
+        help="same as max_removals_per_run in push_to_business_central.json",
+    )
     ap.add_argument("--ops_retention_days", type=int, default=180, help="ops.api_calls and ops.dq_results")
     a = ap.parse_args()
     spark = SparkSession.builder.getOrCreate()
@@ -76,7 +88,7 @@ def main():
         else f"(SELECT * FROM {c}.business_central.sales_invoices WHERE false)"
     )
     # Sales documents of the last publish that the push has not delivered yet: the same rule and the same scope as
-    # local/push_to_business_central.py (latest attempt per key, terminal for the current hash; at most MAX_FAILURES
+    # task push_to_business_central (latest attempt per key, terminal for the current hash; at most MAX_FAILURES
     # failures; new documents inside the scope, and any document sent before whose payload changed).
     pending_sales = f"""(SELECT i.external_document_number AS k FROM {sales} i
         LEFT JOIN (SELECT doc_key,
@@ -95,7 +107,7 @@ def main():
                      OR to_date(i.last_update_at) >= date_sub(current_date(), {a.push_scope_days})))
                OR (s.ever_sent AND s.h IS DISTINCT FROM i.payload_hash)))"""
     # Documents of the last publish that failed MAX_FAILURES times with their current payload: the push no longer
-    # retries them until the data changes or someone runs it with --retry FAILED.
+    # retries them until the data changes or someone runs the job with parameter push_retry=FAILED.
     purchases = (
         f"{c}.business_central.purchase_invoices VERSION AS OF {ver['purchase_invoices']}"
         if "purchase_invoices" in ver
@@ -112,6 +124,17 @@ def main():
         WHERE f.bc_company = '{company}' AND f.result IN ('FAILED', 'SKIPPED', 'NOT_EDITABLE')
           AND (term.t IS NULL OR f.synced_at > term.t)
         GROUP BY ALL HAVING count(*) >= {MAX_FAILURES})"""
+    # Documents synced before that are no longer published and not closed: the push empties them unless there are
+    # more than max_removals_per_run, which points to a broken build or a key change and stops its removal step.
+    removed = f"""(SELECT s.doc_type || ' ' || s.doc_key AS k
+        FROM (SELECT doc_type, doc_key, max_by(result, synced_at) FILTER (WHERE result IN {ATTEMPT}) AS r,
+                     bool_or(result IN {EVER_SENT}) AS ever_sent
+              FROM {c}.ops.business_central_sync WHERE bc_company = '{company}' AND doc_type IN ('sales', 'purchase')
+              GROUP BY ALL) s
+        LEFT ANTI JOIN (SELECT 'sales' AS doc_type, external_document_number AS doc_key FROM {sales}
+                        UNION ALL SELECT 'purchase', purchase_key FROM {purchases}) cur
+          ON cur.doc_type = s.doc_type AND cur.doc_key = s.doc_key
+        WHERE s.ever_sent AND s.r NOT IN {CLOSED})"""
     # last data change of silver.bookings (maintenance commits do not count)
     try:
         hist = sql(f"DESCRIBE HISTORY {c}.silver.bookings LIMIT 50").collect()
@@ -288,8 +311,13 @@ def main():
         ),
         # how much is still waiting for the push, for the dashboard
         "e2e_sales_waiting_for_push": ("warn", f"SELECT k FROM {pending_sales}"),
-        # documents the push gave up on; they need a fix of the cause and a run with --retry FAILED
+        # documents the push gave up on; they need a fix of the cause and a run with job parameter push_retry=FAILED
         "e2e_push_dead_letters": ("alert", f"SELECT k FROM {dead_letters}"),
+        # the removal guard of the push: more documents left the published tables than it empties in one run
+        "e2e_push_removals_over_limit": (
+            "alert",
+            f"SELECT k FROM {removed} WHERE (SELECT count(*) FROM {removed}) > {a.max_removals_per_run}",
+        ),
     }
     sql(f"""CREATE TABLE IF NOT EXISTS {c}.ops.dq_results (
         run_id STRING, checked_at TIMESTAMP, check_name STRING, severity STRING, failed_rows BIGINT, sample STRING)""")

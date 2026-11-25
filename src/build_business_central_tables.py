@@ -4,7 +4,7 @@ business_central.*    customers, vendors, sales and purchase invoices and lines,
                       hash and an action (UPSERT, or CANCEL for cancelled bookings and services)
 ops.dq_results        data-quality results of this run
 ops.publish           write-audit-publish: table versions are published only when every blocking check passes;
-                      local/push_to_business_central.py reads the tables AS OF the last published versions, so it never sees a
+                      task push_to_business_central reads the tables AS OF the last published versions, so it never sees a
                       half-written or failed build, and header and line tables always match.
 
 Check names start with the layer they test (silver_, bronze_, business_central_). End-to-end freshness checks run in the last

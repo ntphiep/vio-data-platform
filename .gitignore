@@ -8,4 +8,3 @@ __pycache__/
 data/
 *.ndjson
 *.ndjson.gz
-local/.push_state.json

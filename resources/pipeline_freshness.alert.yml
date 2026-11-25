@@ -21,7 +21,7 @@ resources:
           subscriptions:
             - user_email: ${workspace.current_user.userName}
       schedule:
-        # minute 25: inside the 10 minutes the warehouse stays up after the push that follows the run at minute 05,
-        # so the alert does not start the warehouse on its own (Free Edition cannot change auto stop)
+        # minute 25: about 20 minutes after the run that starts at minute 05. No task of the job uses the warehouse,
+        # so the alert starts it; it stops 10 minutes after the query (Free Edition cannot change auto stop)
         quartz_cron_schedule: "0 25 * * * ?"
         timezone_id: Asia/Ho_Chi_Minh

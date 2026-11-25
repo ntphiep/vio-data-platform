@@ -8,7 +8,7 @@ Type=oneshot
 WorkingDirectory=%h/W/vio-data-platform/local
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # flock: a manual run and the timer run never overlap; the second one exits at once with code 75
-ExecStart=/usr/bin/flock -n -E 75 %t/vio-push-business-central.lock %h/.local/bin/uv run --no-project --with databricks-sdk --with requests push_to_business_central.py --on-new-run
+ExecStart=/usr/bin/flock -n -E 75 %t/vio-push-business-central.lock %h/.local/bin/uv run --no-project --with databricks-sdk==0.171.0 --with requests==2.34.2 push_to_business_central.py --on-new-run
 TimeoutStartSec=1800
-# exit 75 = another run holds the lock; this run is skipped, not failed
+# exit 75 = another run holds the lock, or the SQL warehouse is unavailable (daily quota); skipped, not failed
 SuccessExitStatus=75

@@ -14,7 +14,9 @@ The SQL alert pipeline_freshness covers the case where the job itself stops runn
 """
 
 import argparse
+import datetime as dt
 import json
+from zoneinfo import ZoneInfo
 
 # same result groups as local/push_to_business_central.py: a document is done when its latest attempt is terminal for its hash
 TERMINAL = (
@@ -23,6 +25,11 @@ TERMINAL = (
 )
 ATTEMPT = TERMINAL[:-1] + ", 'FAILED')"
 MAX_FAILURES = 3
+# Results after which a document may exist in Business Central; same as EVER_SENT in local/push_to_business_central.py.
+EVER_SENT = "('CREATED', 'UPDATED', 'RECREATED', 'CANCELLED_DRAFT_EMPTIED', 'FAILED', 'NEEDS_CREDIT_MEMO')"
+# Lasting alerts fail the task again once a day, at the run of this hour.
+TIMEZONE = "Asia/Ho_Chi_Minh"
+REMINDER_HOUR = 8
 # Minutes after which the last successful extract of an entity is stale: twice its cadence plus margin.
 STALE_MINUTES = {
     "bookings": 150,
@@ -67,21 +74,42 @@ def main():
         else f"(SELECT * FROM {c}.business_central.sales_invoices WHERE false)"
     )
     # Sales documents of the last publish that the push has not delivered yet: the same rule and the same scope as
-    # local/push_to_business_central.py (latest attempt per key, terminal for the current hash; at most MAX_FAILURES failures).
+    # local/push_to_business_central.py (latest attempt per key, terminal for the current hash; at most MAX_FAILURES
+    # failures; new documents inside the scope, and any document sent before whose payload changed).
     pending_sales = f"""(SELECT i.external_document_number AS k FROM {sales} i
         LEFT JOIN (SELECT doc_key,
                           max_by(payload_hash, synced_at) FILTER (WHERE result IN {ATTEMPT}) AS h,
-                          max_by(result, synced_at) FILTER (WHERE result IN {ATTEMPT}) AS r
+                          max_by(result, synced_at) FILTER (WHERE result IN {ATTEMPT}) AS r,
+                          bool_or(result IN {EVER_SENT}) AS ever_sent
                    FROM {c}.ops.business_central_sync WHERE doc_type = 'sales' AND bc_company = '{company}' GROUP BY doc_key) s
           ON s.doc_key = i.external_document_number
         LEFT ANTI JOIN (SELECT doc_key, payload_hash FROM {c}.ops.business_central_sync
                         WHERE doc_type = 'sales' AND result = 'FAILED' AND bc_company = '{company}'
                         GROUP BY ALL HAVING count(*) >= {MAX_FAILURES}) d
           ON d.doc_key = i.external_document_number AND d.payload_hash = i.payload_hash
-        WHERE i.hold_reason IS NULL AND i.doc_action = 'UPSERT'
-          AND NOT (s.r IS NOT NULL AND s.r IN {TERMINAL} AND s.h = i.payload_hash)
-          AND (i.invoice_date >= date_sub(current_date(), {a.push_scope_days})
-               OR to_date(i.last_update_at) >= date_sub(current_date(), {a.push_scope_days})))"""
+        WHERE NOT (s.r IS NOT NULL AND s.r IN {TERMINAL} AND s.h = i.payload_hash)
+          AND ((i.hold_reason IS NULL AND i.doc_action = 'UPSERT'
+                AND (i.invoice_date >= date_sub(current_date(), {a.push_scope_days})
+                     OR to_date(i.last_update_at) >= date_sub(current_date(), {a.push_scope_days})))
+               OR (s.ever_sent AND s.h IS DISTINCT FROM i.payload_hash)))"""
+    # Documents of the last publish that failed MAX_FAILURES times with their current payload: the push no longer
+    # retries them until the data changes or someone runs it with --retry FAILED.
+    purchases = (
+        f"{c}.business_central.purchase_invoices VERSION AS OF {ver['purchase_invoices']}"
+        if "purchase_invoices" in ver
+        else f"(SELECT * FROM {c}.business_central.purchase_invoices WHERE false)"
+    )
+    dead_letters = f"""(SELECT f.doc_type || ' ' || f.doc_key AS k
+        FROM (SELECT 'sales' AS doc_type, external_document_number AS doc_key, payload_hash FROM {sales}
+              UNION ALL SELECT 'purchase', purchase_key, payload_hash FROM {purchases}) cur
+        JOIN {c}.ops.business_central_sync f
+          ON f.doc_type = cur.doc_type AND f.doc_key = cur.doc_key AND f.payload_hash = cur.payload_hash
+        LEFT JOIN (SELECT doc_type, doc_key, max(synced_at) AS t FROM {c}.ops.business_central_sync
+                   WHERE bc_company = '{company}' AND result IN {TERMINAL} GROUP BY ALL) term
+          ON term.doc_type = f.doc_type AND term.doc_key = f.doc_key
+        WHERE f.bc_company = '{company}' AND f.result IN ('FAILED', 'SKIPPED', 'NOT_EDITABLE')
+          AND (term.t IS NULL OR f.synced_at > term.t)
+        GROUP BY ALL HAVING count(*) >= {MAX_FAILURES})"""
     # last data change of silver.bookings (maintenance commits do not count)
     try:
         hist = sql(f"DESCRIBE HISTORY {c}.silver.bookings LIMIT 50").collect()
@@ -249,6 +277,8 @@ def main():
         ),
         # how much is still waiting for the push, for the dashboard
         "e2e_sales_waiting_for_push": ("warn", f"SELECT k FROM {pending_sales}"),
+        # documents the push gave up on; they need a fix of the cause and a run with --retry FAILED
+        "e2e_push_dead_letters": ("alert", f"SELECT k FROM {dead_letters}"),
     }
     sql(f"""CREATE TABLE IF NOT EXISTS {c}.ops.dq_results (
         run_id STRING, checked_at TIMESTAMP, check_name STRING, severity STRING, failed_rows BIGINT, sample STRING)""")
@@ -256,6 +286,14 @@ def main():
         task STRING, run_id STRING, built_at TIMESTAMP, silver_token STRING)""")
     sql(f"""CREATE TABLE IF NOT EXISTS {c}.ops.business_central_sync (synced_at TIMESTAMP, doc_type STRING, doc_key STRING,
              payload_hash STRING, bc_company STRING, bc_id STRING, bc_number STRING, result STRING, error STRING)""")
+    # alerts of the previous run, so a lasting problem fails the task (and e-mails) once, not every hour
+    previous_alerts = {
+        r["check_name"]
+        for r in sql(f"""SELECT check_name FROM {c}.ops.dq_results
+            WHERE run_id = (SELECT max_by(run_id, checked_at) FROM {c}.ops.dq_results
+                            WHERE check_name LIKE 'e2e_%' AND run_id <> '{a.run_id}')
+              AND (severity = 'error' OR (severity = 'alert' AND failed_rows > 0))""").collect()
+    }
     rows_out, alerts = [], []
     for name, (severity, q) in checks.items():
         try:
@@ -296,8 +334,14 @@ def main():
     sql(
         f"DELETE FROM {c}.ops.dq_results WHERE checked_at < current_timestamp() - make_interval(0, 0, 0, {a.ops_retention_days})"
     )
+    # Fail (and e-mail) when an alert starts, and once a day at the morning run while alerts last; otherwise the
+    # alerts stay visible in ops.dq_results and on the dashboard without an e-mail every hour.
+    new_alerts = sorted(set(alerts) - previous_alerts)
+    morning = dt.datetime.now(ZoneInfo(TIMEZONE)).hour == REMINDER_HOUR
+    if new_alerts or (alerts and morning):
+        raise RuntimeError(f"data-quality alert: {alerts} (new since the previous run: {new_alerts})")
     if alerts:
-        raise RuntimeError(f"data-quality alert: {alerts}")
+        print(f"alerts unchanged since the previous run, reminder at {REMINDER_HOUR}:00: {alerts}")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 """Unit tests for the Business Central push helpers (no network, no Databricks).
-Run: uv run --no-project --with pytest --with requests pytest pipeline/tests"""
+Run: uv run --no-project --with pytest --with requests python -m pytest tests"""
 
 import json
 import sys
@@ -532,4 +532,52 @@ def test_data_quality_uses_the_push_result_groups():
 
     assert set(ast.literal_eval(dq.TERMINAL)) == set(m.TERMINAL)
     assert set(ast.literal_eval(dq.ATTEMPT)) == set(m.ATTEMPT)
+    assert set(ast.literal_eval(dq.EVER_SENT)) == set(m.EVER_SENT)
     assert dq.MAX_FAILURES == m.MAX_FAILURES
+
+
+# ------------------------------------------------------------------ timer-mode monitoring
+def run_(start_min_ago, result=None, message=""):
+    from types import SimpleNamespace as NS
+
+    state = NS(result_state=NS(value=result) if result else None, state_message=message)
+    return NS(run_id=start_min_ago, start_time=(10_000 - start_min_ago) * 60000, state=state)
+
+
+def test_job_problem_reports_a_stopped_job():
+    assert "no run of the job started" in m.job_problem([run_(200, "SUCCESS")], 10_000 * 60000)
+
+
+def test_job_problem_reports_repeated_failures_and_ignores_a_running_run():
+    runs = [run_(5), run_(65, "FAILED", "check_data_quality"), run_(125, "FAILED"), run_(185, "FAILED")]
+    assert "last 3 runs of the job failed: check_data_quality" in m.job_problem(runs, 10_000 * 60000)
+    runs[2] = run_(125, "SUCCESS")
+    assert m.job_problem(runs, 10_000 * 60000) is None
+
+
+def test_notify_on_change_notifies_once_per_state(monkeypatch):
+    sent = []
+    monkeypatch.setattr(m, "notify", lambda title, body: sent.append(body))
+    state = {}
+    for problem in ("down", "down", None, None):
+        m.notify_on_change(state, "k", problem, "t")
+    assert sent == ["down", "back to normal"] and state["k"] is None
+
+
+def test_unavailable_warehouse_raises_warehouse_unavailable(monkeypatch):
+    import types
+
+    sql_mod = types.ModuleType("databricks.sdk.service.sql")
+    sql_mod.StatementState = types.SimpleNamespace(PENDING="PENDING", RUNNING="RUNNING", SUCCEEDED="SUCCEEDED")
+    for name in ("databricks", "databricks.sdk", "databricks.sdk.service"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "databricks.sdk.service.sql", sql_mod)
+
+    class Ex:
+        def execute_statement(self, **kw):
+            raise RuntimeError("Sorry, cannot run the resource because you have hit your free daily limit.")
+
+    db = m.DBX.__new__(m.DBX)
+    db.w, db.cfg = type("W", (), {"statement_execution": Ex()})(), {"warehouse_id": "w"}
+    with pytest.raises(m.WarehouseUnavailable):
+        db.q("SELECT 1")

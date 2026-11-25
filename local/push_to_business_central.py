@@ -30,7 +30,11 @@ Flow per run
 
 Timer mode (--on-new-run, used by the systemd timer every 5 minutes): the run asks the Jobs API, which needs no
 SQL warehouse, whether job vio_travel_ingest_transform_publish finished a run since the last push, and exits at once when it did
-not and the last push left nothing behind. State lives in .push_state.json next to this file.
+not and the last push left nothing behind. The same Jobs API answer feeds a dead-man check that works when the daily
+compute quota is used up: no run started for JOB_STALE_MINUTES, or the last JOB_FAILED_RUNS runs failed, raises one
+desktop notification when the state starts, and one when it clears. When the SQL warehouse is unavailable (quota
+used up, warehouse cannot start) the run exits with code 75, which the unit treats as skipped, and the next tick tries
+again. State lives in .push_state.json next to this file.
 
 Usage: uv run --no-project --with databricks-sdk --with requests push_to_business_central.py [--limit N] [--dry-run] [--on-new-run]
 Config: config.json next to this file. The systemd unit wraps the run in flock, so two runs never overlap.
@@ -86,18 +90,77 @@ MAX_BATCH = 100
 
 
 STATE = Path(__file__).parent / ".push_state.json"
+# Exit code that the systemd unit treats as skipped, not failed (SuccessExitStatus=75).
+EXIT_SKIPPED = 75
+# Dead-man check on the job in timer mode: the job runs hourly at minute 05.
+JOB_STALE_MINUTES = 150
+JOB_FAILED_RUNS = 3
+# Messages of the SQL Statement API when the warehouse cannot run anything (Free Edition daily quota).
+WAREHOUSE_UNAVAILABLE = (
+    "could not be processed by the warehouse",
+    "free daily limit",
+    "Cannot start warehouse",
+)
+
+
+GUARD_TITLE = "Vio push into Business Central: removal step skipped"
+
+
+class WarehouseUnavailable(RuntimeError):
+    """The SQL warehouse cannot run statements now; the push is skipped and retried on the next tick."""
+
+
+def notify(title, body):
+    """Desktop notification; printed as well, so the journal keeps it."""
+    print(f"{title}: {body}")
+    try:
+        subprocess.run(["notify-send", "-u", "critical", "-a", "vio-push-business-central", title, body], check=False)
+    except OSError:
+        pass
+
+
+def notify_on_change(state, key, problem, title):
+    """Notify when `problem` (a string, or None when fine) differs from the one stored under `key` in state, so a
+    lasting problem raises one notification instead of one per timer tick."""
+    if problem != state.get(key):
+        notify(title, problem or "back to normal")
+    state[key] = problem
+
+
+def save_state(state):
+    STATE.write_text(json.dumps(state))
 
 
 def load_cfg(path=None):
     return json.loads(Path(path or Path(__file__).parent / "config.json").read_text())
 
 
+def job_problem(runs, now_ms):
+    """Dead-man check on the job from its latest runs (newest first, any state): a text, or None when healthy."""
+    if not runs:
+        return "the job has no run"
+    age = (now_ms - (runs[0].start_time or 0)) / 60000
+    if age > JOB_STALE_MINUTES:
+        return (
+            f"no run of the job started for {age:.0f} minutes (daily quota used up, schedule paused or deploy broken)"
+        )
+    done = [r for r in runs if r.state and r.state.result_state is not None]
+    if len(done) >= JOB_FAILED_RUNS and all(r.state.result_state.value != "SUCCESS" for r in done[:JOB_FAILED_RUNS]):
+        return f"the last {JOB_FAILED_RUNS} runs of the job failed: {(done[0].state.state_message or '')[:200]}"
+    return None
+
+
 def job_run_to_push(cfg, state):
-    """Timer mode: the latest finished run of the job when there is something new to push, else None."""
+    """Timer mode: the latest finished run of the job when there is something new to push, else None. Runs the
+    dead-man check on the same Jobs API answer."""
     from databricks.sdk import WorkspaceClient
 
-    runs = list(WorkspaceClient().jobs.list_runs(job_id=cfg["job_id"], completed_only=True, limit=1))
-    latest = runs[0].run_id if runs else None
+    runs = list(WorkspaceClient().jobs.list_runs(job_id=cfg["job_id"], limit=JOB_FAILED_RUNS + 2))
+    notify_on_change(
+        state, "job_problem", job_problem(runs, time.time() * 1000), "Vio job vio_travel_ingest_transform_publish"
+    )
+    finished = [r for r in runs if r.state and r.state.result_state is not None]
+    latest = finished[0].run_id if finished else None
     if latest is not None and (latest != state.get("last_job_run") or state.get("backlog")):
         return latest
     return None
@@ -171,7 +234,12 @@ class DBX:
         from databricks.sdk.service.sql import StatementState
 
         ex = self.w.statement_execution
-        r = ex.execute_statement(statement=sql, warehouse_id=self.cfg["warehouse_id"], wait_timeout="50s")
+        try:
+            r = ex.execute_statement(statement=sql, warehouse_id=self.cfg["warehouse_id"], wait_timeout="50s")
+        except Exception as e:  # noqa: BLE001 - the SDK raises BadRequest for an unavailable warehouse
+            if any(m in str(e) for m in WAREHOUSE_UNAVAILABLE):
+                raise WarehouseUnavailable(str(e)[:300]) from e
+            raise
         t_end = time.time() + deadline_s
         while r.status.state in (StatementState.PENDING, StatementState.RUNNING):
             if time.time() > t_end:
@@ -180,6 +248,9 @@ class DBX:
             time.sleep(3)
             r = ex.get_statement(r.statement_id)
         if r.status.state != StatementState.SUCCEEDED:
+            message = r.status.error.message if r.status.error else ""
+            if any(m in (message or "") for m in WAREHOUSE_UNAVAILABLE):
+                raise WarehouseUnavailable(message[:300])
             raise RuntimeError(f"SQL failed: {r.status.error.message if r.status.error else r.status.state}")
         cols = [col.name for col in r.manifest.schema.columns] if r.manifest and r.manifest.schema else []
         rows, res = [], r.result
@@ -710,8 +781,19 @@ def main():
     ap.add_argument("--on-new-run", action="store_true", help="exit unless the job finished a run since the last push")
     a = ap.parse_args()
     cfg = load_cfg()
-    limit = a.limit or cfg.get("max_bookings_per_run", 100)
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    try:
+        run(a, cfg, state)
+    except WarehouseUnavailable as e:
+        print(f"SQL warehouse unavailable, push skipped until the next tick: {e}")
+        sys.exit(EXIT_SKIPPED)
+    finally:
+        save_state(state)
+
+
+def run(a, cfg, state):
+    """One push. Updates state in place; main() saves it. Exits 1 when a document or party failed."""
+    limit = a.limit or cfg.get("max_bookings_per_run", 100)
     job_run = None
     if a.on_new_run:
         job_run = job_run_to_push(cfg, state)
@@ -737,8 +819,9 @@ def main():
     removed = db.q(q["removed"])
     if not todo and not held and not removed:
         print("nothing to push")
+        notify_on_change(state, "removal_guard", None, GUARD_TITLE)
         if job_run is not None:
-            STATE.write_text(json.dumps({"last_job_run": job_run, "backlog": False}))
+            state.update(last_job_run=job_run, backlog=False)
         return
     p_heads = [p for h in todo for p in h["_purchases"]]
 
@@ -823,8 +906,17 @@ def main():
         for doc_type, key, phash, reason in held:
             record(doc_type, key, phash, None, "HELD", reason)
         flush()
-        if not process_removals(bc, removed, cfg.get("max_removals_per_run", 50), record):
-            failed_total += 1
+        # A tripped guard needs a person, not a retry: it notifies once when it starts and once when it clears,
+        # instead of failing the unit on every tick.
+        guard_ok = process_removals(bc, removed, cfg.get("max_removals_per_run", 50), record)
+        notify_on_change(
+            state,
+            "removal_guard",
+            None
+            if guard_ok
+            else "more synced documents than max_removals_per_run are no longer published; check the build",
+            GUARD_TITLE,
+        )
         flush()
 
         def send(doc_type, key, phash, party, cur, day, fn):
@@ -912,7 +1004,7 @@ def main():
         flush()
         if job_run is not None:
             # more bookings waiting than this run took: the next timer tick continues without a new job run
-            STATE.write_text(json.dumps({"last_job_run": job_run, "backlog": pending > len(todo)}))
+            state.update(last_job_run=job_run, backlog=pending > len(todo))
     print(f"done: results written to {c}.ops.business_central_sync, {failed_total} failed")
     sys.exit(1 if failed_total else 0)
 

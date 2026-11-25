@@ -204,6 +204,8 @@ measures:
     expr: COUNT(1)
   - name: Active bookings
     expr: COUNT(1) FILTER (WHERE is_active)
+  - name: Cancelled bookings
+    expr: COUNT(1) FILTER (WHERE is_cancelled)
   - name: Cancellation rate
     expr: COUNT(1) FILTER (WHERE is_cancelled) / COUNT(1)
   - name: Revenue

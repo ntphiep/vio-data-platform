@@ -55,6 +55,17 @@ EXAMPLES = {
 FROM {CATALOG}.gold.booking_metrics GROUP BY ALL ORDER BY 1, 2""",
     "Overdue amount by ageing bucket": f"""SELECT `Ageing bucket`, Currency, MEASURE(`Amount to pay`) AS amount_to_pay
 FROM {CATALOG}.gold.receivable_metrics GROUP BY ALL ORDER BY 1, 2""",
+    "Top 10 suppliers by sale amount this year": f"""SELECT Supplier, Currency, MEASURE(`Sale amount`) AS sale_amount,
+  MEASURE(`Margin in booking currency`) AS margin
+FROM {CATALOG}.gold.service_metrics
+WHERE left(`Booking month`, 4) = CAST(year(current_date()) AS STRING)
+GROUP BY ALL ORDER BY sale_amount DESC LIMIT 10""",
+    "Agencies with the most overdue amount": f"""SELECT Agency, Currency, MEASURE(`Overdue amount`) AS overdue_amount,
+  MEASURE(`Average days overdue`) AS average_days_overdue
+FROM {CATALOG}.gold.receivable_metrics GROUP BY ALL HAVING overdue_amount > 0 ORDER BY overdue_amount DESC LIMIT 10""",
+    "Share of purchase attempts that became bookings": f"""SELECT count(*) AS purchase_attempts,
+  count_if(is_converted) AS converted, avg(CAST(is_converted AS INT)) AS conversion_rate
+FROM {CATALOG}.gold.fact_purchase_attempt""",
 }
 
 

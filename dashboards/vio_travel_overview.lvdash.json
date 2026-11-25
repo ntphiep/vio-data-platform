@@ -4,11 +4,13 @@
       "name": "booking_kpis",
       "displayName": "booking_kpis",
       "queryLines": [
-        "SELECT count_if(is_active) AS active_bookings,\n",
-        "sum(CASE WHEN is_active AND currency = 'USD' THEN total_price END) AS revenue_usd,\n",
-        "sum(CASE WHEN is_active AND currency = 'USD' THEN gross_margin END) AS gross_margin_usd,\n",
-        "count_if(is_cancelled) AS cancelled_bookings\n",
-        "FROM gold.fact_booking\n"
+        "SELECT sum(active_bookings) AS active_bookings,\n",
+        "sum(revenue) FILTER (WHERE currency = 'USD') AS revenue_usd,\n",
+        "sum(gross_margin) FILTER (WHERE currency = 'USD') AS gross_margin_usd,\n",
+        "sum(cancelled_bookings) AS cancelled_bookings\n",
+        "FROM (SELECT Currency AS currency, MEASURE(`Active bookings`) AS active_bookings, MEASURE(Revenue) AS revenue,\n",
+        "MEASURE(`Gross margin`) AS gross_margin, MEASURE(`Cancelled bookings`) AS cancelled_bookings\n",
+        "FROM gold.booking_metrics GROUP BY ALL)\n"
       ]
     },
     {

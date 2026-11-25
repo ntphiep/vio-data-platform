@@ -148,6 +148,33 @@
         "sql": [
           "SELECT `Ageing bucket`, Currency, MEASURE(`Amount to pay`) AS amount_to_pay\nFROM vio_travel.gold.receivable_metrics GROUP BY ALL ORDER BY 1, 2"
         ]
+      },
+      {
+        "id": "ba0b4c6ccad65805a43fae1a1203e87c",
+        "question": [
+          "Top 10 suppliers by sale amount this year"
+        ],
+        "sql": [
+          "SELECT Supplier, Currency, MEASURE(`Sale amount`) AS sale_amount,\n  MEASURE(`Margin in booking currency`) AS margin\nFROM vio_travel.gold.service_metrics\nWHERE left(`Booking month`, 4) = CAST(year(current_date()) AS STRING)\nGROUP BY ALL ORDER BY sale_amount DESC LIMIT 10"
+        ]
+      },
+      {
+        "id": "466cacccf7d55210bbccb11ef670e1a3",
+        "question": [
+          "Agencies with the most overdue amount"
+        ],
+        "sql": [
+          "SELECT Agency, Currency, MEASURE(`Overdue amount`) AS overdue_amount,\n  MEASURE(`Average days overdue`) AS average_days_overdue\nFROM vio_travel.gold.receivable_metrics GROUP BY ALL HAVING overdue_amount > 0 ORDER BY overdue_amount DESC LIMIT 10"
+        ]
+      },
+      {
+        "id": "7c45157e68e0541c938e92d9514efe72",
+        "question": [
+          "Share of purchase attempts that became bookings"
+        ],
+        "sql": [
+          "SELECT count(*) AS purchase_attempts,\n  count_if(is_converted) AS converted, avg(CAST(is_converted AS INT)) AS conversion_rate\nFROM vio_travel.gold.fact_purchase_attempt"
+        ]
       }
     ]
   }

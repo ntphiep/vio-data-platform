@@ -29,12 +29,15 @@ AGEING_BUCKET = """CASE WHEN due_date IS NULL THEN 'No due date'
 
 DATASETS = {
     # ---------------- page: Bookings and revenue ----------------
+    # the KPI tiles read metric view booking_metrics, so they use the same definitions as Genie and SQL users
     "booking_kpis": """
-        SELECT count_if(is_active) AS active_bookings,
-               sum(CASE WHEN is_active AND currency = 'USD' THEN total_price END) AS revenue_usd,
-               sum(CASE WHEN is_active AND currency = 'USD' THEN gross_margin END) AS gross_margin_usd,
-               count_if(is_cancelled) AS cancelled_bookings
-        FROM gold.fact_booking""",
+        SELECT sum(active_bookings) AS active_bookings,
+               sum(revenue) FILTER (WHERE currency = 'USD') AS revenue_usd,
+               sum(gross_margin) FILTER (WHERE currency = 'USD') AS gross_margin_usd,
+               sum(cancelled_bookings) AS cancelled_bookings
+        FROM (SELECT Currency AS currency, MEASURE(`Active bookings`) AS active_bookings, MEASURE(Revenue) AS revenue,
+                     MEASURE(`Gross margin`) AS gross_margin, MEASURE(`Cancelled bookings`) AS cancelled_bookings
+              FROM gold.booking_metrics GROUP BY ALL)""",
     "bookings_by_created_month": """
         SELECT date_trunc('MONTH', d.date) AS created_month, f.status, count(*) AS bookings,
                sum(CASE WHEN f.currency = 'USD' THEN f.total_price END) AS revenue_usd

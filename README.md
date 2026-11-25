@@ -153,11 +153,12 @@ keys have `RELY`, which lets the optimizer remove redundant joins, and Genie rea
 | `obt_booking_service` | `fact_booking_service` joined with every dimension, for ad-hoc SQL and Genie |
 
 The metric views `booking_metrics`, `service_metrics` and `receivable_metrics` (YAML 1.1) define revenue, margin,
-cancellation rate, cost by supplier and amounts due once, for the dashboard, Genie and SQL users. Amounts stay in the
+cancellation rate, cost by supplier and amounts due once, for the dashboard KPI tiles, Genie and SQL users. Amounts stay in the
 booking currency and every metric view has a `Currency` dimension, so no total adds two currencies.
 
 The dashboard `Vio Travel overview` has 5 pages, named Bookings and revenue, Suppliers and cost, Payments due, Ideas,
-hotels and checkouts, and Pipeline operations. The Genie space `Vio Travel Genie` reads the 3 metric views and 10 gold
+hotels and checkouts, and Pipeline operations. The dashboard runs with each viewer's permissions, and only data
+engineers can read `ops` and `business_central`, so the Pipeline operations page is for them. The Genie space `Vio Travel Genie` reads the 3 metric views and 10 gold
 tables, and answers with the permissions of the user who asks.
 
 ![Page Bookings and revenue of the dashboard Vio Travel overview](docs/dashboard.png)
@@ -173,8 +174,8 @@ never posts.
 |---|---|---|
 | customer | Travel Compositor agency, or the customer that `ref.customer_map` assigns to a booking of an umbrella agency | `AG<agency id>`, or the number in `ref.customer_map` |
 | vendor | Travel Compositor supplier, provider code of an API service, or `ref.vendor_map` for manual services | `SP<id>`, `PV<code>`, or the number in `ref.vendor_map` |
-| sales invoice | one per booking in status BOOKED, RQ (on request) or CANCELED, one line per active service | `externalDocumentNumber` = booking reference |
-| purchase invoice | one per service with a cost | `vendorInvoiceNumber` = service id and type code |
+| sales invoice | one per booking in status BOOKED, RQ (on request) or CANCELED, one line per active service (sale price plus amendments) | `externalDocumentNumber` = booking reference |
+| purchase invoice | one per service with a cost (net cost plus amendments) | `vendorInvoiceNumber` = service id and type code |
 | currency exchange rate | rate of the ECB (European Central Bank) from the Frankfurter API; for currencies the ECB does not publish (VND, Vietnamese dong; FJD, Fiji dollar), the median Travel Compositor cost rate of at least 3 nearby services | currency and date |
 
 `build_business_central_tables` rebuilds the six tables, runs its blocking checks, and records their Delta versions in
@@ -188,12 +189,16 @@ not an app registration. Each run:
 1. Asks the Jobs API whether `vio_travel_ingest_transform_publish` finished a run since the last push.
 2. Reads the six tables `VERSION AS OF` the last published versions, so it sees one consistent, checked build.
 3. Compares each document's `payload_hash` with its last result in table `ops.business_central_sync` and selects up to
-   100 bookings with changes, oldest first. Only bookings whose invoice date or last update falls in the last 30 days
-   are in scope (`scope_sql` in `local/config.json`); `--scope_sql` widens it for a backfill.
+   100 bookings with changes, oldest first. New documents are taken only when the invoice date or last update falls
+   in the last 30 days (`scope_sql` in `local/config.json`; `--scope_sql` widens it for a backfill); a document sent
+   before whose payload changed is always taken.
 4. Upserts customers and vendors, and loads missing exchange rates through a RapidStart configuration package.
 5. Creates a draft with its lines in one deep-insert POST, or replaces the header and lines of an existing draft in one
    transactional OData `$batch`. A posted document is never changed and is reported with status `NEEDS_CREDIT_MEMO`. A
-   cancelled booking empties its draft so it cannot be posted. Drafts are never deleted, because deleting a numbered
+   cancelled booking or service empties its draft so it cannot be posted. Travel Compositor sets the cost of a
+   cancelled service to 0, so the tables keep such a service, and a booking left without lines, as a `CANCEL` row; a
+   synced document that disappears from the tables is emptied as well, and more than 50 at once
+   (`max_removals_per_run`) stop that step for a person to check. Drafts are never deleted, because deleting a numbered
    draft makes Business Central create an empty posted invoice.
 6. Writes one result row per document into `ops.business_central_sync` after every booking.
 
@@ -290,11 +295,11 @@ says why; the values come from Finance or the partner.
 | `vio_travel_apply_governance` | Sunday 03:45; run by hand after each deploy | masking function, tags, masks, grants, comments, plain views, metric views, anomaly detection | deploying user, who owns the catalog |
 | `vio_travel_backfill_bookings` | manual | `plan_backfill_windows` → for-each `extract_booking_windows` (one month per iteration, 3 in parallel) | service principal |
 | `vio-push-business-central.timer` (systemd) | every 5 minutes, acts after each finished job run | `push_to_business_central.py --on-new-run` under `flock` | the Business Central user |
-| SQL alert `pipeline_freshness` | hourly, at minute 50 | dead-man switch on `ops.dq_results` | deploying user |
+| SQL alert `pipeline_freshness` | hourly, at minute 25, while the warehouse is still up after the push | dead-man switch on `ops.dq_results` | deploying user |
 
 Task `extract_travel_compositor` retries twice, 5 minutes apart. The pipeline retries a failed update once by itself
 (pipeline setting `pipelines.numUpdateRetryAttempts`), so its task has no retry. `build_business_central_tables` retries
-once. The job times out after 2 hours, and a run that starts while another is active waits in the queue.
+once. The job times out after 45 minutes, and a run that starts while another is active waits in the queue.
 
 The backfill job only lands files and never moves the watermark; the next scheduled run loads them. So the two jobs
 never update the pipeline or rebuild `business_central` at the same time, and a failed month is re-read with Repair
@@ -321,14 +326,19 @@ keys. Check names follow the convention in [Conventions](#conventions).
 
 | Stage | Fresh within | Watched by |
 |---|---|---|
-| Travel Compositor to silver | 30 minutes plus run time | `e2e_extract_failing_or_stale`, `e2e_pipeline_failed_or_stale` |
+| Travel Compositor to silver | 1 hour plus run time | `e2e_extract_failing_or_stale`, `e2e_pipeline_failed_or_stale` |
 | silver to gold, dashboard, Genie | same pipeline update | expectations, `gold_` checks |
 | silver to `business_central` | same job run | `e2e_business_central_behind_silver` |
-| `business_central` to Business Central | 5 minutes after the run, 100 bookings per push | `e2e_push_stalled`, `e2e_sales_waiting_for_push` |
-| the job itself | | SQL alert `pipeline_freshness`: no `e2e_` row for 75 minutes, evaluated hourly, so a stopped job is detected within about 2 hours |
+| `business_central` to Business Central | 5 minutes after the run, 100 bookings per push | `e2e_push_stalled`, `e2e_sales_waiting_for_push`, `e2e_push_dead_letters` |
+| the job itself | | the push timer, from the Jobs API every 5 minutes: no run started for 150 minutes, or the last 3 runs failed; SQL alert `pipeline_freshness`: no `e2e_` row for 150 minutes |
 
-The job e-mails on failure and on runs longer than 30 minutes (`health` rule), the pipeline e-mails on update and
-flow failure, and the push unit raises a desktop notification when it fails. The dashboard page Pipeline operations
+Notifications fire when a problem starts, not on every run. Task `check_data_quality` fails, and the job e-mails,
+when an alert check starts failing, and again once a day at the 08:00 run while it lasts; the results of every run
+stay in `ops.dq_results`. The job also e-mails on runs longer than 30 minutes (`health` rule), and the pipeline on
+update and flow failure. The push timer needs no Databricks compute for its job check, so it still reports when the
+daily quota stops every job and warehouse; it raises one desktop notification when a problem starts and one when it
+clears, and the push unit raises one when a run fails. A push that finds the SQL warehouse unavailable exits with code
+75 and is retried on the next tick, and a tripped removal guard notifies once. The dashboard page Pipeline operations
 shows run times, API calls, check results and the push backlog from `ops`.
 
 ## Performance and cost
@@ -338,9 +348,11 @@ shows run times, API calls, check results and the push backlog from `ops`.
   on column `run_id`, table `accommodations_history` on country and hotel, table `accommodation_details` on hotel,
   and the other tables use `CLUSTER BY AUTO`. Predictive optimization runs OPTIMIZE, VACUUM and statistics.
 - Silver streaming tables have change data feed and row tracking; bronze has deletion vectors and row tracking.
-- Serverless compute everywhere. The pipeline is triggered, not continuous, because the source changes at most every
-  30 minutes and Free Edition has a daily compute quota. A scheduled run takes about 7 minutes, so the job uses about
-  5.5 hours of serverless compute a day. The system table `system.billing.usage` shows the cost per product,
+- Serverless compute everywhere. The pipeline is triggered, not continuous, because Free Edition has a daily compute
+  quota. With a run every 30 minutes the quota ran out at about 14:00 each day and no job, pipeline or warehouse
+  started until it reset, so the job runs hourly. A scheduled run takes about 7 minutes. The Starter Warehouse stops
+  10 minutes after its last query and Free Edition does not allow changing that, so the alert runs inside the
+  window the push already opened. The system table `system.billing.usage` shows the cost per product,
   including anomaly detection, which has the value `DATA_QUALITY_MONITORING` in column `billing_origin_product`.
 - Free Edition allows one active pipeline and 5 concurrent tasks, and the metastore stopped at 500 tables with the
   error state `UC_RESOURCE_QUOTA_EXCEEDED`. Each pipeline table counts twice because of its hidden
@@ -438,7 +450,7 @@ IDs only, no credential.
 
 ## Limitations
 
-- A booking change reaches silver with the next scheduled run, up to 30 minutes plus run time later.
+- A booking change reaches silver with the next scheduled run, up to 1 hour plus run time later.
 - Exchange rates come from the ECB and from Travel Compositor costs, not from the rates Finance uses.
 - Table `ref.customer_map` and table `ref.vendor_map` hold lab seed rows that Finance has not approved.
 - The push owns its drafts: an edit made by hand to a draft is replaced the next time the booking changes.

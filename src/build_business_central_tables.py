@@ -34,9 +34,9 @@ TABLE_COMMENTS = {
     "customers": "Business Central customers: one per Travel Compositor agency (AG<id>), plus customers of ref.customer_map.",
     "vendors": "Business Central vendors: Travel Compositor suppliers (SP<id>), providers (PV<code>), ref.vendor_map.",
     "sales_invoices": "One sales invoice per BOOKED, RQ or CANCELED booking (externalDocumentNumber); CANCEL when the booking is cancelled or has no line left; held when hold_reason is set.",
-    "sales_lines": "Lines of sales_invoices: one per BOOKED or RQ service with a non-zero sale amount, in the sale currency.",
+    "sales_lines": "Lines of sales_invoices: one per BOOKED or RQ service with a non-zero sale amount (sale price plus amendments), in the sale currency.",
     "purchase_invoices": "One purchase invoice per service with a non-zero cost (vendorInvoiceNumber = purchase_key), plus CANCEL rows for cancelled services; held when hold_reason is set.",
-    "purchase_lines": "One line per UPSERT purchase invoice: the service cost in the cost currency.",
+    "purchase_lines": "One line per UPSERT purchase invoice: the service cost plus amendments in the cost currency.",
 }
 PII_TABLES = ["customers", "vendors"]
 # Type code in purchase_key and vendor_invoice_number: Travel Compositor service IDs are unique only inside one
@@ -80,13 +80,15 @@ def type_code_sql(col: str = "service_type") -> str:
 def silver_token(sql, c: str) -> str:
     """Token that changes only when the data this task reads changes.
 
-    Bookings: row count and a hash of every (booking_ref, last_update_at); services change only with their booking.
+    Bookings: row count and a hash of every (booking_ref, last_update_at, payload): Travel Compositor sometimes
+    changes amounts or services without moving lastUpdateDate, so the payload is part of the token.
     Agencies and suppliers: count and a hash of every current row. Ref tables: their Delta version, which changes
     only on an edit. Pipeline tables are refreshed every run, so their Delta version is not a change signal.
     """
     parts = [
         str(
-            sql(f"""SELECT count(*) || ':' || coalesce(sum(CAST(xxhash64(booking_ref, last_update_at) AS DECIMAL(38, 0))), 0)
+            sql(f"""SELECT count(*) || ':' || coalesce(sum(CAST(xxhash64(booking_ref, last_update_at, CAST(payload AS STRING))
+                                                       AS DECIMAL(38, 0))), 0)
                          FROM {c}.silver.bookings""").first()[0]
         )
     ]
@@ -183,10 +185,10 @@ def main():
                row_number() OVER (PARTITION BY s.booking_ref ORDER BY s.service_id, s.service_type) AS line_no,
                left(s.service_type || ' - ' || trim(regexp_replace(regexp_replace(coalesce(s.name, ''), '<[^>]*>', ' '),
                     '\\\\s+', ' ')), 100) AS description,
-               s.sale_amount AS amount, s.sale_currency AS currency
+               s.sale_amount + coalesce(s.amendment_sale_amount, 0) AS amount, s.sale_currency AS currency
         FROM {c}.silver.booking_services s
         JOIN booking_customer b ON b.booking_ref = s.booking_ref AND b.doc_action = 'UPSERT'
-        WHERE s.status IN ('BOOKED', 'RQ') AND s.sale_amount <> 0""")
+        WHERE s.status IN ('BOOKED', 'RQ') AND s.sale_amount + coalesce(s.amendment_sale_amount, 0) <> 0""")
     # A booking keeps its sales invoice row while it is BOOKED, RQ or CANCELED. When it has no line left (every
     # service cancelled or sold at 0) the row stays with doc_action CANCEL, so the push empties a draft it sent
     # before through the normal path; a document that vanished from the table would count as an unexplained removal.
@@ -223,7 +225,8 @@ def main():
     # Purchases: one invoice per service (implementation partner spec API_Purchases_T01 row 5). Vendor: Travel Compositor
     # supplier ID; for API services without one, the provider code; for manual services, ref.vendor_map.
     sql(f"""CREATE OR REPLACE TEMP VIEW service_vendor AS
-        SELECT s.*, b.created_at AS booking_created_at,
+        SELECT s.* EXCEPT (cost_amount), s.cost_amount + coalesce(s.amendment_cost_amount, 0) AS cost_amount,
+               b.created_at AS booking_created_at,
                CASE WHEN b.doc_action = 'UPSERT' AND s.status IN ('BOOKED', 'RQ') THEN 'UPSERT' ELSE 'CANCEL' END
                  AS doc_action,
                CASE WHEN s.supplier_id IS NOT NULL THEN 'SP' || s.supplier_id
@@ -240,7 +243,7 @@ def main():
         LEFT JOIN {c}.ref.vendor_map mm ON mm.source_kind = 'MANUAL_NAME'
                                         AND mm.source_key = lower(trim(s.supplier_name))
         LEFT JOIN {c}.silver.suppliers sp ON sp.supplier_id = s.supplier_id
-        WHERE (s.cost_amount IS NOT NULL AND s.cost_amount <> 0)
+        WHERE s.cost_amount + coalesce(s.amendment_cost_amount, 0) <> 0
            OR NOT (b.doc_action = 'UPSERT' AND s.status IN ('BOOKED', 'RQ'))""")
     sql(f"""CREATE OR REPLACE TABLE {b}.purchase_invoices AS
         -- Travel Compositor service IDs are unique only inside one service type, so the key adds a type code.
